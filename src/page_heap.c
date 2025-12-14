@@ -121,6 +121,16 @@ static void addr_insert_sorted(Span* s)
     if (cur) cur->prev_addr = s;
 }
 
+/*remove span from address-sorted doubly-linked list*/
+static void addr_remove(Span* s)
+{
+    if (s->prev_addr) s->prev_addr->next_addr = s->next_addr;
+    else page_heap.addr_head = s->next_addr;
+    if (s->next_addr) s->next_addr->prev_addr = s->prev_addr;
+    s->prev_addr = NULL;
+    s->next_addr = NULL;
+}
+
 /*check if two free spans are adjacent and can merge*/
 static int can_coalesce(Span* a, Span* b)
 {
@@ -292,4 +302,55 @@ PageHeapStats pageheap_stats(void)
     st.spans_in_use = page_heap.spans_in_use;
     st.spans_free = page_heap.spans_free;
     return st;
+}
+
+/*release fully free spans with page_count >= min_pages using munmap; returns released pages*/
+size_t pageheap_release_empty_spans(size_t min_pages)
+{
+    if (!page_heap.page_size) pageheap_init();
+    if (min_pages == 0) min_pages = 1;
+    size_t released_pages = 0;
+    Span* cur = page_heap.addr_head;
+    while (cur){
+        Span* next = cur->next_addr; /* save next since cur may be removed */
+        if (!cur->in_use && cur->page_count >= min_pages){
+            size_t bytes = cur->page_count * psize();
+            if (munmap(cur->start, bytes) == 0){
+                /* unlink from bucket and addr list */
+                bucket_remove(cur);
+                addr_remove(cur);
+                /* update stats */
+                page_heap.mapped_pages -= cur->page_count;
+                page_heap.free_pages   -= cur->page_count;
+                page_heap.spans_free   -= 1;
+                released_pages         += cur->page_count;
+                /* recycle metadata */
+                meta_release(cur);
+            } else {
+                /* munmap failed; keep span intact. Optionally fall back to madvise here. */
+            }
+        }
+        cur = next;
+    }
+    return released_pages;
+}
+
+/*soft reclaim free spans with page_count >= min_pages using madvise(DONTNEED); returns advised pages*/
+size_t pageheap_madvise_idle_spans(size_t min_pages)
+{
+    if (!page_heap.page_size) pageheap_init();
+    if (min_pages == 0) min_pages = 1;
+    size_t advised_pages = 0;
+    Span* cur = page_heap.addr_head;
+    while (cur){
+        Span* next = cur->next_addr;
+        if (!cur->in_use && cur->page_count >= min_pages){
+            size_t bytes = cur->page_count * psize();
+            /* ignore errors; madvise may fail on some OS */
+            (void)madvise(cur->start, bytes, MADV_DONTNEED);
+            advised_pages += cur->page_count;
+        }
+        cur = next;
+    }
+    return advised_pages;
 }

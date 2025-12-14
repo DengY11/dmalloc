@@ -57,6 +57,11 @@ size_t span_page_count(Span* span);
 
 PageHeapStats pageheap_stats(void);
 
+/*release fully free spans back to OS via munmap; returns released pages*/
+size_t pageheap_release_empty_spans(size_t min_pages);
+
+/*soft reclaim: advise OS that pages are not needed; returns advised pages*/
+size_t pageheap_madvise_idle_spans(size_t min_pages);
 
 
 #endif
