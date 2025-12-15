@@ -1,6 +1,6 @@
 CC       := clang
-CFLAGS   := -std=c11 -Wall -Wextra -O2 -I include
-LDFLAGS  :=
+CFLAGS   := -std=c11 -Wall -Wextra -O2 -I include -pthread
+LDFLAGS  := -pthread
 
 SRC_DIR  := src
 TEST_DIR := tests
@@ -8,7 +8,7 @@ BUILD_DIR:= build
 
 SRCS     := $(SRC_DIR)/page_heap.c $(SRC_DIR)/large_bucket.c $(SRC_DIR)/dmalloc.c
 
-TESTS    := $(BUILD_DIR)/test_page_heap $(BUILD_DIR)/test_large_bucket $(BUILD_DIR)/test_dmalloc
+TESTS    := $(BUILD_DIR)/test_page_heap $(BUILD_DIR)/test_large_bucket $(BUILD_DIR)/test_dmalloc $(BUILD_DIR)/test_thread_safety
 BENCH    := $(BUILD_DIR)/bench_malloc_vs_dmalloc
 
 .PHONY: all clean test run-tests
@@ -29,6 +29,9 @@ $(BUILD_DIR)/test_dmalloc: $(BUILD_DIR) $(SRCS) $(TEST_DIR)/test_dmalloc.c inclu
 
 $(BUILD_DIR)/bench_malloc_vs_dmalloc: $(BUILD_DIR) $(SRCS) $(TEST_DIR)/bench_malloc_vs_dmalloc.c include/dmalloc.h include/page_heap.h
 	$(CC) $(CFLAGS) $(SRCS) $(TEST_DIR)/bench_malloc_vs_dmalloc.c -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/test_thread_safety: $(BUILD_DIR) $(SRCS) $(TEST_DIR)/test_thread_safety.c include/dmalloc.h include/page_heap.h
+	$(CC) $(CFLAGS) $(SRCS) $(TEST_DIR)/test_thread_safety.c -o $@ $(LDFLAGS)
 
 test: $(TESTS)
 	$(BUILD_DIR)/test_page_heap

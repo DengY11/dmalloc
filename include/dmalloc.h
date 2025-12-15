@@ -2,6 +2,7 @@
 #define DMALLOC_H
 #include <stddef.h>
 #include <stdint.h>
+#include <pthread.h>
 #define D_ALIGN     16
 #define MAX_SMALL   1024
 
@@ -14,6 +15,7 @@ typedef struct _ObjHdr {
 typedef struct _CentralFreeList {
     void*   head;         /* singly list of ObjHdr* (stored in payload) */
     size_t  obj_size;     /* payload size for this class */
+    pthread_mutex_t lock;
 } CentralFreeList;
 
 typedef struct _SmallSpan {
@@ -28,4 +30,3 @@ void  dfree(void* ptr);
 void* drealloc(void* ptr, size_t size);
 
 #endif /* DMALLOC_H */
-

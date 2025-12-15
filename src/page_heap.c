@@ -7,6 +7,7 @@
 #include <stdint.h>
 
 static PageHeap page_heap;
+static pthread_once_t pageheap_once = PTHREAD_ONCE_INIT;
 
 
 /*get current page size in bytes*/
@@ -48,12 +49,14 @@ static void* meta_chunk_new(size_t n)
 /*get a usable span from meta_free_list*/
 static Span* meta_acquire(void)
 {
+    pthread_mutex_lock(&page_heap.meta_lock);
     if (!meta_free_list){
-        if (!meta_chunk_new(META_CHUNK_NEW_SIZE)) return NULL;
+        if (!meta_chunk_new(META_CHUNK_NEW_SIZE)){ pthread_mutex_unlock(&page_heap.meta_lock); return NULL; }
     }
     Span* s = meta_free_list;
     meta_free_list = meta_free_list->next_free_addr;
     memset(s, 0, sizeof(Span));
+    pthread_mutex_unlock(&page_heap.meta_lock);
     return s;
 }
 
@@ -61,8 +64,10 @@ static Span* meta_acquire(void)
 /*return a Span node back to metadata pool*/
 static void meta_release(Span* s)
 {
+    pthread_mutex_lock(&page_heap.meta_lock);
     s->next_free_addr = meta_free_list;
     meta_free_list = s;
+    pthread_mutex_unlock(&page_heap.meta_lock);
 }
 
 /*push free span into its size bucket list*/
@@ -72,8 +77,10 @@ static void bucket_insert(Span* s)
     if (is_large_bucket_idx(idx)){
         large_bucket_insert(&page_heap, s);
     }else{
+        pthread_mutex_lock(&page_heap.bucket_lock[idx]);
         s->next_free_addr = page_heap.free_buckets[idx];
         page_heap.free_buckets[idx] = s;
+        pthread_mutex_unlock(&page_heap.bucket_lock[idx]);
     }
 }
 
@@ -85,6 +92,7 @@ static void bucket_remove(Span* s)
         large_bucket_remove(&page_heap, s);
         return;
     }
+    pthread_mutex_lock(&page_heap.bucket_lock[idx]);
     Span* cur = page_heap.free_buckets[idx];
     Span* prev = NULL;
     while (cur){
@@ -92,20 +100,24 @@ static void bucket_remove(Span* s)
             if (prev) prev->next_free_addr = cur->next_free_addr;
             else page_heap.free_buckets[idx] = cur->next_free_addr;
             s->next_free_addr = NULL;
+            pthread_mutex_unlock(&page_heap.bucket_lock[idx]);
             return;
         }
         prev = cur;
         cur = cur->next_free_addr;
     }
+    pthread_mutex_unlock(&page_heap.bucket_lock[idx]);
 }
 
 /*insert span into address-sorted doubly-linked list*/
 static void addr_insert_sorted(Span* s)
 {
+    pthread_mutex_lock(&page_heap.addr_lock);
     if (!page_heap.addr_head){
         page_heap.addr_head = s;
         s->prev_addr = NULL;
         s->next_addr = NULL;
+        pthread_mutex_unlock(&page_heap.addr_lock);
         return;
     }
     Span* cur = page_heap.addr_head;
@@ -119,16 +131,19 @@ static void addr_insert_sorted(Span* s)
     s->next_addr = cur;
     if (prev) prev->next_addr = s; else page_heap.addr_head = s;
     if (cur) cur->prev_addr = s;
+    pthread_mutex_unlock(&page_heap.addr_lock);
 }
 
 /*remove span from address-sorted doubly-linked list*/
 static void addr_remove(Span* s)
 {
+    pthread_mutex_lock(&page_heap.addr_lock);
     if (s->prev_addr) s->prev_addr->next_addr = s->next_addr;
     else page_heap.addr_head = s->next_addr;
     if (s->next_addr) s->next_addr->prev_addr = s->prev_addr;
     s->prev_addr = NULL;
     s->next_addr = NULL;
+    pthread_mutex_unlock(&page_heap.addr_lock);
 }
 
 /*check if two free spans are adjacent and can merge*/
@@ -143,6 +158,7 @@ static int can_coalesce(Span* a, Span* b)
 /*merge with left/right free neighbors and reinsert into bucket*/
 static void coalesce_neighbors(Span* s)
 {
+    pthread_mutex_lock(&page_heap.addr_lock);
     Span* left = s->prev_addr;
     if (can_coalesce(left, s)){
         bucket_remove(left);
@@ -151,7 +167,9 @@ static void coalesce_neighbors(Span* s)
         if (s->next_addr) s->next_addr->prev_addr = left;
         meta_release(s);
         s = left;
+        pthread_mutex_lock(&page_heap.stats_lock);
         page_heap.spans_free -= 1;
+        pthread_mutex_unlock(&page_heap.stats_lock);
     }
     Span* right = s->next_addr;
     if (can_coalesce(s, right)){
@@ -160,9 +178,12 @@ static void coalesce_neighbors(Span* s)
         s->next_addr = right->next_addr;
         if (right->next_addr) right->next_addr->prev_addr = s;
         meta_release(right);
+        pthread_mutex_lock(&page_heap.stats_lock);
         page_heap.spans_free -= 1;
+        pthread_mutex_unlock(&page_heap.stats_lock);
     }
     bucket_insert(s);
+    pthread_mutex_unlock(&page_heap.addr_lock);
 }
 
 /*initialize page heap state and metadata pool*/
@@ -171,13 +192,26 @@ void pageheap_init(void)
     memset(&page_heap, 0, sizeof(page_heap));
     page_heap.page_size = (size_t)sysconf(_SC_PAGESIZE);
     meta_free_list = NULL;
+    pthread_mutex_init(&page_heap.addr_lock, NULL);
+    pthread_mutex_init(&page_heap.skiplist_lock, NULL);
+    pthread_mutex_init(&page_heap.meta_lock, NULL);
+    pthread_mutex_init(&page_heap.stats_lock, NULL);
+    for (size_t i = 0; i < MAX_BUCKETS; i++){
+        pthread_mutex_init(&page_heap.bucket_lock[i], NULL);
+    }
     /* initialize large bucket skiplist */
     large_bucket_init(&page_heap);
+}
+
+void pageheap_ensure_init(void)
+{
+    pthread_once(&pageheap_once, pageheap_init);
 }
 
 /*return page size for external queries*/
 size_t pageheap_page_size(void)
 {
+    pageheap_ensure_init();
     return psize();
 }
 
@@ -194,7 +228,7 @@ static Span* span_create(void* start, size_t in_use)
 /*map more pages from OS and publish one free span*/
 int pageheap_grow(size_t page_count)
 {
-    if (!page_heap.page_size) pageheap_init();
+    pageheap_ensure_init();
     if (!page_count) page_count = DEFAULT_GROW_PAGES;
     size_t bytes = page_count * psize();
     void* p = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -207,46 +241,75 @@ int pageheap_grow(size_t page_count)
     s->page_count = page_count;
     addr_insert_sorted(s);
     bucket_insert(s);
+    pthread_mutex_lock(&page_heap.stats_lock);
     page_heap.mapped_pages += page_count;
     page_heap.free_pages += page_count;
     page_heap.spans_free += 1;
+    pthread_mutex_unlock(&page_heap.stats_lock);
     return 0;
 }
 
 /*search buckets for span with >= requested pages*/
-static Span* find_suitable(size_t page_count) {
+static Span* select_span(size_t page_count) {
     size_t idx = bucket_index(page_count);
     if (idx < MAX_BUCKETS - 1) {
-        Span* head = page_heap.free_buckets[idx];
-        if (head) return head; /*in this bucket, all spans have same page_count*/
-        /*not found in this bucket, try larger buckets*/
-        for (size_t i = idx + 1; i < MAX_BUCKETS - 1; i++) {
+        for (size_t i = idx; i < MAX_BUCKETS - 1; i++){
+            pthread_mutex_lock(&page_heap.bucket_lock[i]);
             Span* h = page_heap.free_buckets[i];
-            if (h) return h; 
+            if (h){
+                page_heap.free_buckets[i] = h->next_free_addr;
+                h->next_free_addr = NULL;
+                pthread_mutex_unlock(&page_heap.bucket_lock[i]);
+                return h;
+            }
+            pthread_mutex_unlock(&page_heap.bucket_lock[i]);
         }
     }
-    /* last bucket: use skiplist lower_bound */
-    return large_bucket_lower_bound(&page_heap, page_count);
+    pthread_mutex_lock(&page_heap.skiplist_lock);
+    Span* head = page_heap.large_skip_head;
+    if (!head){
+        pthread_mutex_unlock(&page_heap.skiplist_lock);
+        return NULL;
+    }
+    Span* update[MAX_SKIP_LEVELS];
+    Span* x = head;
+    for (int i = MAX_SKIP_LEVELS - 1; i >= 0; i--){
+        while (x->skip_next[i] && x->skip_next[i]->page_count < page_count) x = x->skip_next[i];
+        update[i] = x;
+    }
+    Span* cand = x->skip_next[0];
+    if (!cand){
+        pthread_mutex_unlock(&page_heap.skiplist_lock);
+        return NULL;
+    }
+    for (int i = 0; i < (int)cand->skip_level; i++){
+        if (update[i]->skip_next[i] == cand) update[i]->skip_next[i] = cand->skip_next[i];
+    }
+    for (int i = 0; i < MAX_SKIP_LEVELS; i++) cand->skip_next[i] = NULL;
+    cand->skip_level = 0;
+    pthread_mutex_unlock(&page_heap.skiplist_lock);
+    return cand;
 }
 
 /*allocate a span; split if larger; grow if needed*/
 Span* span_alloc(size_t page_count)
 {
-    if (!page_heap.page_size) pageheap_init();
+    pageheap_ensure_init();
     if (!page_count) return NULL;
-    Span* s = find_suitable(page_count);
+    Span* s = select_span(page_count);
     if (!s){
         size_t grow = page_count < DEFAULT_GROW_PAGES ? DEFAULT_GROW_PAGES : page_count;
         if (pageheap_grow(grow) != 0) return NULL;
-        s = find_suitable(page_count);
+        s = select_span(page_count);
         if (!s) return NULL;
     }
-    bucket_remove(s);
     if (s->page_count == page_count){
         s->in_use = 1;
+        pthread_mutex_lock(&page_heap.stats_lock);
         page_heap.free_pages -= s->page_count;
         page_heap.spans_free -= 1;
         page_heap.spans_in_use += 1;
+        pthread_mutex_unlock(&page_heap.stats_lock);
         return s;
     }
     size_t remain = s->page_count - page_count;
@@ -256,13 +319,17 @@ Span* span_alloc(size_t page_count)
     Span* r = span_create(remain_start, 0);
     if (!r) return NULL;
     r->page_count = remain;
+    pthread_mutex_lock(&page_heap.addr_lock);
     r->next_addr = s->next_addr;
     r->prev_addr = s;
     if (s->next_addr) s->next_addr->prev_addr = r;
     s->next_addr = r;
     bucket_insert(r);
+    pthread_mutex_lock(&page_heap.stats_lock);
     page_heap.spans_in_use += 1;
     page_heap.free_pages -= page_count;
+    pthread_mutex_unlock(&page_heap.stats_lock);
+    pthread_mutex_unlock(&page_heap.addr_lock);
     return s;
 }
 
@@ -272,9 +339,11 @@ void span_free(Span* s)
     if (!s) return;
     if (!s->in_use) return;
     s->in_use = 0;
+    pthread_mutex_lock(&page_heap.stats_lock);
     page_heap.spans_in_use -= 1;
     page_heap.free_pages += s->page_count;
     page_heap.spans_free += 1;
+    pthread_mutex_unlock(&page_heap.stats_lock);
     coalesce_neighbors(s);
 }
 
@@ -296,11 +365,14 @@ size_t span_page_count(Span* span)
 PageHeapStats pageheap_stats(void)
 {
     PageHeapStats st;
+    pageheap_ensure_init();
+    pthread_mutex_lock(&page_heap.stats_lock);
     st.page_size = page_heap.page_size;
     st.mapped_pages = page_heap.mapped_pages;
     st.free_pages = page_heap.free_pages;
     st.spans_in_use = page_heap.spans_in_use;
     st.spans_free = page_heap.spans_free;
+    pthread_mutex_unlock(&page_heap.stats_lock);
     return st;
 }
 
@@ -309,54 +381,77 @@ Span* pageheap_span_for_addr(void* addr)
 {
     if (!addr) return NULL;
     uintptr_t a = (uintptr_t)addr;
+    pthread_mutex_lock(&page_heap.addr_lock);
     Span* cur = page_heap.addr_head;
     size_t ps = psize();
     while (cur){
         uintptr_t s = (uintptr_t)cur->start;
         uintptr_t e = s + cur->page_count * ps;
-        if (a >= s && a < e) return cur;
+        if (a >= s && a < e){
+            pthread_mutex_unlock(&page_heap.addr_lock);
+            return cur;
+        }
         /* address-sorted list allows early break */
         if (a < s) break;
         cur = cur->next_addr;
     }
+    pthread_mutex_unlock(&page_heap.addr_lock);
     return NULL;
 }
 
 /*release fully free spans with page_count >= min_pages using munmap; returns released pages*/
 size_t pageheap_release_empty_spans(size_t min_pages)
 {
-    if (!page_heap.page_size) pageheap_init();
+    pageheap_ensure_init();
     if (min_pages == 0) min_pages = 1;
     size_t released_pages = 0;
+    pthread_mutex_lock(&page_heap.addr_lock);
     Span* cur = page_heap.addr_head;
     while (cur){
         Span* next = cur->next_addr; /* save next since cur may be removed */
         if (!cur->in_use && cur->page_count >= min_pages){
             size_t bytes = cur->page_count * psize();
+            /* unlink from bucket and addr list under addr_lock to keep lock order */
+            bucket_remove(cur);
+            if (cur->prev_addr) cur->prev_addr->next_addr = cur->next_addr;
+            else page_heap.addr_head = cur->next_addr;
+            if (cur->next_addr) cur->next_addr->prev_addr = cur->prev_addr;
+            cur->prev_addr = NULL;
+            cur->next_addr = NULL;
+            pthread_mutex_unlock(&page_heap.addr_lock);
             if (munmap(cur->start, bytes) == 0){
-                /* unlink from bucket and addr list */
-                bucket_remove(cur);
-                addr_remove(cur);
-                /* update stats */
+                pthread_mutex_lock(&page_heap.stats_lock);
                 page_heap.mapped_pages -= cur->page_count;
                 page_heap.free_pages   -= cur->page_count;
                 page_heap.spans_free   -= 1;
+                pthread_mutex_unlock(&page_heap.stats_lock);
                 released_pages         += cur->page_count;
-                /* recycle metadata */
                 meta_release(cur);
             } else {
-                /* munmap failed; keep span intact. Optionally fall back to madvise here. */
+                /* rollback: reinsert into lists if munmap failed */
+                pthread_mutex_lock(&page_heap.addr_lock);
+                if (page_heap.addr_head){
+                    cur->next_addr = page_heap.addr_head;
+                    page_heap.addr_head->prev_addr = cur;
+                    page_heap.addr_head = cur;
+                } else {
+                    page_heap.addr_head = cur;
+                }
+                pthread_mutex_unlock(&page_heap.addr_lock);
+                bucket_insert(cur);
             }
+            pthread_mutex_lock(&page_heap.addr_lock);
         }
         cur = next;
     }
+    pthread_mutex_unlock(&page_heap.addr_lock);
     return released_pages;
 }
 
 /*soft reclaim free spans with page_count >= min_pages using madvise(DONTNEED); returns advised pages*/
 size_t pageheap_madvise_idle_spans(size_t min_pages)
 {
-    if (!page_heap.page_size) pageheap_init();
+    pageheap_ensure_init();
     if (min_pages == 0) min_pages = 1;
     size_t advised_pages = 0;
     Span* cur = page_heap.addr_head;

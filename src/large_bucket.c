@@ -36,13 +36,16 @@ static void ensure_head(PageHeap* heap)
 void large_bucket_init(PageHeap* heap)
 {
     /* seed RNG for random level */
+    pthread_mutex_lock(&heap->skiplist_lock);
     srand((unsigned)time(NULL));
     heap->large_skip_head = NULL;
     ensure_head(heap);
+    pthread_mutex_unlock(&heap->skiplist_lock);
 }
 
 void large_bucket_insert(PageHeap* heap, Span* s)
 {
+    pthread_mutex_lock(&heap->skiplist_lock);
     ensure_head(heap);
     Span* update[MAX_SKIP_LEVELS];
     Span* x = heap->large_skip_head;
@@ -56,11 +59,16 @@ void large_bucket_insert(PageHeap* heap, Span* s)
         s->skip_next[i] = update[i]->skip_next[i];
         update[i]->skip_next[i] = s;
     }
+    pthread_mutex_unlock(&heap->skiplist_lock);
 }
 
 void large_bucket_remove(PageHeap* heap, Span* s)
 {
-    if (!heap->large_skip_head || !s) return;
+    pthread_mutex_lock(&heap->skiplist_lock);
+    if (!heap->large_skip_head || !s){
+        pthread_mutex_unlock(&heap->skiplist_lock);
+        return;
+    }
     Span* update[MAX_SKIP_LEVELS];
     Span* x = heap->large_skip_head;
     for (int i = MAX_SKIP_LEVELS - 1; i >= 0; i--){
@@ -70,6 +78,7 @@ void large_bucket_remove(PageHeap* heap, Span* s)
     Span* target = x->skip_next[0];
     if (target != s){
         /* not found; do nothing */
+        pthread_mutex_unlock(&heap->skiplist_lock);
         return;
     }
     for (int i = 0; i < MAX_SKIP_LEVELS; i++){
@@ -77,14 +86,21 @@ void large_bucket_remove(PageHeap* heap, Span* s)
     }
     for (int i = 0; i < MAX_SKIP_LEVELS; i++) s->skip_next[i] = NULL;
     s->skip_level = 0;
+    pthread_mutex_unlock(&heap->skiplist_lock);
 }
 
 Span* large_bucket_lower_bound(PageHeap* heap, size_t need)
 {
-    if (!heap->large_skip_head) return NULL;
+    pthread_mutex_lock(&heap->skiplist_lock);
+    if (!heap->large_skip_head){
+        pthread_mutex_unlock(&heap->skiplist_lock);
+        return NULL;
+    }
     Span* x = heap->large_skip_head;
     for (int i = MAX_SKIP_LEVELS - 1; i >= 0; i--){
         while (x->skip_next[i] && x->skip_next[i]->page_count < need) x = x->skip_next[i];
     }
-    return x->skip_next[0];
+    Span* r = x->skip_next[0];
+    pthread_mutex_unlock(&heap->skiplist_lock);
+    return r;
 }

@@ -2,6 +2,7 @@
 #define PAGE_HEAP_H
 #include <stddef.h>
 #include <stdint.h>
+#include <pthread.h>
 
 #define MAX_BUCKETS (64)
 #define DEFAULT_GROW_PAGES (64)
@@ -31,6 +32,11 @@ typedef struct _PageHeap{
     size_t free_pages;
     size_t spans_in_use;
     size_t spans_free;
+    pthread_mutex_t addr_lock;
+    pthread_mutex_t bucket_lock[MAX_BUCKETS];
+    pthread_mutex_t skiplist_lock;
+    pthread_mutex_t meta_lock;
+    pthread_mutex_t stats_lock;
 } PageHeap;
 
 typedef struct _PageHeapStats {
@@ -42,6 +48,7 @@ typedef struct _PageHeapStats {
 } PageHeapStats;
 
 void pageheap_init(void);
+void pageheap_ensure_init(void);
 size_t pageheap_page_size(void);
 
 /*alloc at least page_count pages*/

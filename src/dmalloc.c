@@ -29,6 +29,7 @@ static void central_init_once(void)
                                                memory_order_acq_rel, memory_order_acquire)){
         /* we won the initialization */
         for (size_t i = 0; i < (MAX_SMALL / D_ALIGN); i++){
+            pthread_mutex_init(&central[i].lock, NULL);
             central[i].head = NULL;
             central[i].obj_size = (i + 1) * D_ALIGN;
         }
@@ -72,6 +73,7 @@ static void central_grow(int sc)
         return;
     }
 
+    pthread_mutex_lock(&central[sc].lock);
     for (size_t i = 0; i < capacity; i++){
         uint8_t* p = base + offset + i * slot;
         ObjHdr* h = (ObjHdr*)p;
@@ -85,6 +87,7 @@ static void central_grow(int sc)
         ss->total_objs++;
         ss->free_objs++;
     }
+    pthread_mutex_unlock(&central[sc].lock);
 }
 
 void* dmalloc(size_t size)
@@ -105,15 +108,22 @@ void* dmalloc(size_t size)
         h->flags = 1; /* large */
         return (void*)(base + obj_header_size());
     }
-    if (!central[sc].head) central_grow(sc);
-    if (!central[sc].head) return NULL;
-    /* pop one */
+    pthread_mutex_lock(&central[sc].lock);
+    if (!central[sc].head){
+        pthread_mutex_unlock(&central[sc].lock);
+        central_grow(sc);
+        pthread_mutex_lock(&central[sc].lock);
+    }
+    if (!central[sc].head){
+        pthread_mutex_unlock(&central[sc].lock);
+        return NULL;
+    }
     void* user = central[sc].head;
-    central[sc].head = *(void**)user;/*here is tricky, the first few bytes of payload
-                                    is a pointer to the next free object*/
+    central[sc].head = *(void**)user;
     ObjHdr* h = (ObjHdr*)((uint8_t*)user - obj_header_size());
     SmallSpan* ss = (SmallSpan*)h->owner;
-    if (ss) ss->free_objs--; /* defensive */
+    if (ss) ss->free_objs--;
+    pthread_mutex_unlock(&central[sc].lock);
     return user;
 }
 
@@ -129,6 +139,7 @@ void dfree(void* ptr)
     }
     /* small: push back to central list */
     int sc = (int)h->size_class;
+    pthread_mutex_lock(&central[sc].lock);
     *(void**)ptr = central[sc].head;
     central[sc].head = ptr;
     SmallSpan* ss = (SmallSpan*)h->owner;
@@ -154,13 +165,16 @@ void dfree(void* ptr)
             prev = cur;
             cur = next;
         }
+        pthread_mutex_unlock(&central[sc].lock);
         /* find backing Span by address and free it to page heap */
         Span* backing = pageheap_span_for_addr((void*)ss);
         if (backing){
             span_free(backing);
         }
         /* Note: ss memory is part of the span and will be invalid after span_free */
+        return;
     }
+    pthread_mutex_unlock(&central[sc].lock);
 }
 
 void* drealloc(void* ptr, size_t size)
