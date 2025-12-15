@@ -9,10 +9,11 @@ BUILD_DIR:= build
 SRCS     := $(SRC_DIR)/page_heap.c $(SRC_DIR)/large_bucket.c $(SRC_DIR)/dmalloc.c
 
 TESTS    := $(BUILD_DIR)/test_page_heap $(BUILD_DIR)/test_large_bucket $(BUILD_DIR)/test_dmalloc
+BENCH    := $(BUILD_DIR)/bench_malloc_vs_dmalloc
 
 .PHONY: all clean test run-tests
 
-all: $(TESTS)
+all: $(TESTS) $(BENCH)
 
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)
@@ -26,11 +27,19 @@ $(BUILD_DIR)/test_large_bucket: $(BUILD_DIR) $(SRCS) $(TEST_DIR)/test_large_buck
 $(BUILD_DIR)/test_dmalloc: $(BUILD_DIR) $(SRCS) $(TEST_DIR)/test_dmalloc.c include/dmalloc.h include/page_heap.h
 	$(CC) $(CFLAGS) $(SRCS) $(TEST_DIR)/test_dmalloc.c -o $@ $(LDFLAGS)
 
+$(BUILD_DIR)/bench_malloc_vs_dmalloc: $(BUILD_DIR) $(SRCS) $(TEST_DIR)/bench_malloc_vs_dmalloc.c include/dmalloc.h include/page_heap.h
+	$(CC) $(CFLAGS) $(SRCS) $(TEST_DIR)/bench_malloc_vs_dmalloc.c -o $@ $(LDFLAGS)
+
 test: $(TESTS)
 	$(BUILD_DIR)/test_page_heap
 	$(BUILD_DIR)/test_large_bucket
+	$(BUILD_DIR)/test_dmalloc
 
 run-tests: test
+
+.PHONY: bench
+bench: $(BENCH)
+	$(BUILD_DIR)/bench_malloc_vs_dmalloc
 
 clean:
 	rm -rf $(BUILD_DIR)

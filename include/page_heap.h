@@ -57,6 +57,9 @@ size_t span_page_count(Span* span);
 
 PageHeapStats pageheap_stats(void);
 
+/* locate the Span that contains the given address; returns NULL if not found */
+Span* pageheap_span_for_addr(void* addr);
+
 /*release fully free spans back to OS via munmap; returns released pages*/
 size_t pageheap_release_empty_spans(size_t min_pages);
 

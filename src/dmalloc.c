@@ -133,6 +133,34 @@ void dfree(void* ptr)
     central[sc].head = ptr;
     SmallSpan* ss = (SmallSpan*)h->owner;
     if (ss) ss->free_objs++;
+    /* if this SmallSpan is fully free, reclaim the whole span */
+    if (ss && ss->free_objs == ss->total_objs){
+        /* remove all nodes from central list that belong to this SmallSpan */
+        void* cur = central[sc].head;
+        void* prev = NULL;
+        while (cur){
+            ObjHdr* oh = (ObjHdr*)((uint8_t*)cur - obj_header_size());
+            void* next = *(void**)cur;
+            if (oh->owner == (void*)ss){
+                /* unlink cur */
+                if (prev){
+                    *(void**)prev = next;
+                } else {
+                    central[sc].head = next;
+                }
+                cur = next;
+                continue;
+            }
+            prev = cur;
+            cur = next;
+        }
+        /* find backing Span by address and free it to page heap */
+        Span* backing = pageheap_span_for_addr((void*)ss);
+        if (backing){
+            span_free(backing);
+        }
+        /* Note: ss memory is part of the span and will be invalid after span_free */
+    }
 }
 
 void* drealloc(void* ptr, size_t size)

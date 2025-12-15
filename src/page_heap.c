@@ -304,6 +304,24 @@ PageHeapStats pageheap_stats(void)
     return st;
 }
 
+/* find the Span that contains the given address */
+Span* pageheap_span_for_addr(void* addr)
+{
+    if (!addr) return NULL;
+    uintptr_t a = (uintptr_t)addr;
+    Span* cur = page_heap.addr_head;
+    size_t ps = psize();
+    while (cur){
+        uintptr_t s = (uintptr_t)cur->start;
+        uintptr_t e = s + cur->page_count * ps;
+        if (a >= s && a < e) return cur;
+        /* address-sorted list allows early break */
+        if (a < s) break;
+        cur = cur->next_addr;
+    }
+    return NULL;
+}
+
 /*release fully free spans with page_count >= min_pages using munmap; returns released pages*/
 size_t pageheap_release_empty_spans(size_t min_pages)
 {
