@@ -3,10 +3,29 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <pthread.h>
+#include <stdlib.h>
 
 
 
 static CentralFreeList central[ (MAX_SMALL / D_ALIGN) ];
+static pthread_mutex_t central_lock[ (MAX_SMALL / D_ALIGN) ];
+
+typedef struct {
+    void* head;
+    size_t count;
+} TCacheList;
+
+typedef struct {
+    TCacheList lists[ (MAX_SMALL / D_ALIGN) ];
+} ThreadCache;
+
+static pthread_key_t tc_key;
+static pthread_once_t tc_once = PTHREAD_ONCE_INIT;
+
+static inline size_t tcache_max(void){ return 64; }
+static inline size_t tcache_refill_batch(void){ return 32; }
+static inline size_t tcache_release_batch(void){ return 64; }
 
 static inline size_t round_up(size_t x, size_t a){ return (x + a - 1) & ~(a - 1); }
 
@@ -31,6 +50,7 @@ static void central_init_once(void)
         for (size_t i = 0; i < (MAX_SMALL / D_ALIGN); i++){
             central[i].head = NULL;
             central[i].obj_size = (i + 1) * D_ALIGN;
+            pthread_mutex_init(&central_lock[i], NULL);
         }
         atomic_store_explicit(&init_state, 2, memory_order_release);
         return;
@@ -79,12 +99,84 @@ static void central_grow(int sc)
         h->size_class = (uint16_t)sc;
         h->flags = 0;
         void* user = (void*)(p + hdr);
-        /* push into central freelist */
         *(void**)user = central[sc].head;
         central[sc].head = user;
         ss->total_objs++;
         ss->free_objs++;
     }
+}
+
+static size_t central_fetch_batch(int sc, void** out, size_t n)
+{
+    size_t got = 0;
+    pthread_mutex_lock(&central_lock[sc]);
+    if (!central[sc].head) central_grow(sc);
+    while (central[sc].head && got < n){
+        void* user = central[sc].head;
+        central[sc].head = *(void**)user;
+        ObjHdr* h = (ObjHdr*)((uint8_t*)user - obj_header_size());
+        SmallSpan* ss = (SmallSpan*)h->owner;
+        if (ss) ss->free_objs--;
+        out[got++] = user;
+    }
+    pthread_mutex_unlock(&central_lock[sc]);
+    return got;
+}
+
+static void central_release_batch(int sc, void** list, size_t n)
+{
+    pthread_mutex_lock(&central_lock[sc]);
+    for (size_t i = 0; i < n; i++){
+        void* ptr = list[i];
+        *(void**)ptr = central[sc].head;
+        central[sc].head = ptr;
+        ObjHdr* h = (ObjHdr*)((uint8_t*)ptr - obj_header_size());
+        SmallSpan* ss = (SmallSpan*)h->owner;
+        if (ss) ss->free_objs++;
+    }
+    pthread_mutex_unlock(&central_lock[sc]);
+}
+
+static void tc_destroy(void* p)
+{
+    ThreadCache* tc = (ThreadCache*)p;
+    if (!tc) return;
+    for (size_t i = 0; i < (MAX_SMALL / D_ALIGN); i++){
+        size_t sc = i;
+        size_t batch = tcache_release_batch();
+        void** tmp = (void**)malloc(sizeof(void*) * batch);
+        while (tc->lists[i].head){
+            size_t n = 0;
+            while (tc->lists[i].head && n < batch){
+                void* user = tc->lists[i].head;
+                tc->lists[i].head = *(void**)user;
+                n++;
+                tmp[n-1] = user;
+            }
+            if (n) central_release_batch((int)sc, tmp, n);
+        }
+        free(tmp);
+        tc->lists[i].count = 0;
+    }
+    free(tc);
+}
+
+static void tc_init_key(void)
+{
+    pthread_key_create(&tc_key, tc_destroy);
+}
+
+static ThreadCache* tc_get(void)
+{
+    pthread_once(&tc_once, tc_init_key);
+    ThreadCache* tc = (ThreadCache*)pthread_getspecific(tc_key);
+    if (!tc){
+        tc = (ThreadCache*)malloc(sizeof(ThreadCache));
+        if (!tc) return NULL;
+        memset(tc, 0, sizeof(ThreadCache));
+        pthread_setspecific(tc_key, tc);
+    }
+    return tc;
 }
 
 void* dmalloc(size_t size)
@@ -105,15 +197,26 @@ void* dmalloc(size_t size)
         h->flags = 1; /* large */
         return (void*)(base + obj_header_size());
     }
-    if (!central[sc].head) central_grow(sc);
-    if (!central[sc].head) return NULL;
-    /* pop one */
-    void* user = central[sc].head;
-    central[sc].head = *(void**)user;/*here is tricky, the first few bytes of payload
-                                    is a pointer to the next free object*/
-    ObjHdr* h = (ObjHdr*)((uint8_t*)user - obj_header_size());
-    SmallSpan* ss = (SmallSpan*)h->owner;
-    if (ss) ss->free_objs--; /* defensive */
+    ThreadCache* tc = tc_get();
+    if (!tc) return NULL;
+    TCacheList* list = &tc->lists[sc];
+    if (!list->head){
+        size_t batch = tcache_refill_batch();
+        void** tmp = (void**)malloc(sizeof(void*) * batch);
+        if (!tmp) return NULL;
+        size_t got = central_fetch_batch(sc, tmp, batch);
+        for (size_t i = 0; i < got; i++){
+            void* p = tmp[i];
+            *(void**)p = list->head;
+            list->head = p;
+            list->count++;
+        }
+        free(tmp);
+        if (!list->head) return NULL;
+    }
+    void* user = list->head;
+    list->head = *(void**)user;
+    if (list->count) list->count--;
     return user;
 }
 
@@ -127,12 +230,30 @@ void dfree(void* ptr)
         span_free(sp);
         return;
     }
-    /* small: push back to central list */
     int sc = (int)h->size_class;
-    *(void**)ptr = central[sc].head;
-    central[sc].head = ptr;
-    SmallSpan* ss = (SmallSpan*)h->owner;
-    if (ss) ss->free_objs++;
+    ThreadCache* tc = tc_get();
+    if (!tc){
+        void* one = ptr;
+        central_release_batch(sc, &one, 1);
+        return;
+    }
+    TCacheList* list = &tc->lists[sc];
+    *(void**)ptr = list->head;
+    list->head = ptr;
+    list->count++;
+    if (list->count > tcache_max()){
+        size_t batch = tcache_release_batch();
+        void** tmp = (void**)malloc(sizeof(void*) * batch);
+        size_t n = 0;
+        while (list->head && n < batch){
+            void* p = list->head;
+            list->head = *(void**)p;
+            tmp[n++] = p;
+        }
+        central_release_batch(sc, tmp, n);
+        free(tmp);
+        if (list->count >= n) list->count -= n; else list->count = 0;
+    }
 }
 
 void* drealloc(void* ptr, size_t size)

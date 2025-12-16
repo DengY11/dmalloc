@@ -22,10 +22,8 @@ typedef struct _SmallSpan {
     size_t  free_objs;    /* number of free objects currently */
 } SmallSpan;
 
-/* small object allocator API */
 void* dmalloc(size_t size);
 void  dfree(void* ptr);
 void* drealloc(void* ptr, size_t size);
 
 #endif /* DMALLOC_H */
-

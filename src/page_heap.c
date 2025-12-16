@@ -5,8 +5,10 @@
 #include <sys/mman.h>
 #include <string.h>
 #include <stdint.h>
+#include <pthread.h>
 
 static PageHeap page_heap;
+static pthread_mutex_t page_heap_mutex;
 
 
 /*get current page size in bytes*/
@@ -173,6 +175,7 @@ void pageheap_init(void)
     meta_free_list = NULL;
     /* initialize large bucket skiplist */
     large_bucket_init(&page_heap);
+    pthread_mutex_init(&page_heap_mutex, NULL);
 }
 
 /*return page size for external queries*/
@@ -192,7 +195,7 @@ static Span* span_create(void* start, size_t in_use)
 }
 
 /*map more pages from OS and publish one free span*/
-int pageheap_grow(size_t page_count)
+static int pageheap_grow_nolock(size_t page_count)
 {
     if (!page_heap.page_size) pageheap_init();
     if (!page_count) page_count = DEFAULT_GROW_PAGES;
@@ -211,6 +214,15 @@ int pageheap_grow(size_t page_count)
     page_heap.free_pages += page_count;
     page_heap.spans_free += 1;
     return 0;
+}
+
+int pageheap_grow(size_t page_count)
+{
+    if (!page_heap.page_size) pageheap_init();
+    pthread_mutex_lock(&page_heap_mutex);
+    int r = pageheap_grow_nolock(page_count);
+    pthread_mutex_unlock(&page_heap_mutex);
+    return r;
 }
 
 /*search buckets for span with >= requested pages*/
@@ -234,12 +246,13 @@ Span* span_alloc(size_t page_count)
 {
     if (!page_heap.page_size) pageheap_init();
     if (!page_count) return NULL;
+    pthread_mutex_lock(&page_heap_mutex);
     Span* s = find_suitable(page_count);
     if (!s){
         size_t grow = page_count < DEFAULT_GROW_PAGES ? DEFAULT_GROW_PAGES : page_count;
-        if (pageheap_grow(grow) != 0) return NULL;
+        if (pageheap_grow_nolock(grow) != 0){ pthread_mutex_unlock(&page_heap_mutex); return NULL; }
         s = find_suitable(page_count);
-        if (!s) return NULL;
+        if (!s){ pthread_mutex_unlock(&page_heap_mutex); return NULL; }
     }
     bucket_remove(s);
     if (s->page_count == page_count){
@@ -247,6 +260,7 @@ Span* span_alloc(size_t page_count)
         page_heap.free_pages -= s->page_count;
         page_heap.spans_free -= 1;
         page_heap.spans_in_use += 1;
+        pthread_mutex_unlock(&page_heap_mutex);
         return s;
     }
     size_t remain = s->page_count - page_count;
@@ -254,7 +268,7 @@ Span* span_alloc(size_t page_count)
     s->page_count = page_count;
     s->in_use = 1;
     Span* r = span_create(remain_start, 0);
-    if (!r) return NULL;
+    if (!r){ pthread_mutex_unlock(&page_heap_mutex); return NULL; }
     r->page_count = remain;
     r->next_addr = s->next_addr;
     r->prev_addr = s;
@@ -263,6 +277,7 @@ Span* span_alloc(size_t page_count)
     bucket_insert(r);
     page_heap.spans_in_use += 1;
     page_heap.free_pages -= page_count;
+    pthread_mutex_unlock(&page_heap_mutex);
     return s;
 }
 
@@ -271,11 +286,13 @@ void span_free(Span* s)
 {
     if (!s) return;
     if (!s->in_use) return;
+    pthread_mutex_lock(&page_heap_mutex);
     s->in_use = 0;
     page_heap.spans_in_use -= 1;
     page_heap.free_pages += s->page_count;
     page_heap.spans_free += 1;
     coalesce_neighbors(s);
+    pthread_mutex_unlock(&page_heap_mutex);
 }
 
 /*get start address of span*/
@@ -310,6 +327,7 @@ size_t pageheap_release_empty_spans(size_t min_pages)
     if (!page_heap.page_size) pageheap_init();
     if (min_pages == 0) min_pages = 1;
     size_t released_pages = 0;
+    pthread_mutex_lock(&page_heap_mutex);
     Span* cur = page_heap.addr_head;
     while (cur){
         Span* next = cur->next_addr; /* save next since cur may be removed */
@@ -332,6 +350,7 @@ size_t pageheap_release_empty_spans(size_t min_pages)
         }
         cur = next;
     }
+    pthread_mutex_unlock(&page_heap_mutex);
     return released_pages;
 }
 
@@ -341,6 +360,7 @@ size_t pageheap_madvise_idle_spans(size_t min_pages)
     if (!page_heap.page_size) pageheap_init();
     if (min_pages == 0) min_pages = 1;
     size_t advised_pages = 0;
+    pthread_mutex_lock(&page_heap_mutex);
     Span* cur = page_heap.addr_head;
     while (cur){
         Span* next = cur->next_addr;
@@ -352,5 +372,6 @@ size_t pageheap_madvise_idle_spans(size_t min_pages)
         }
         cur = next;
     }
+    pthread_mutex_unlock(&page_heap_mutex);
     return advised_pages;
 }
