@@ -185,46 +185,14 @@ void* dmalloc(size_t size)
         size_t ps = pageheap_page_size();
         size_t need = round_up(size + obj_header_size(), D_ALIGN);
         size_t npages = (need + ps - 1) / ps;
-        if (npages >= 32){
-            size_t bytes = npages * ps;
-            void* mem = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            if (mem == MAP_FAILED) return NULL;
-            uint8_t* base = (uint8_t*)mem;
-            ObjHdr* h = (ObjHdr*)base;
-            h->owner = NULL;
-            h->size_class = (uint16_t)npages;
-            h->flags = 3;
-            return (void*)(base + obj_header_size());
-        }
-        ThreadCache* tc = tc_get();
-        if (!tc) return NULL;
-        Span* sp = NULL;
-        int bidx = -1;
-        for (int i = 0; i < LARGE_BUCKET_COUNT; i++) if (tc->lbuckets[i].pages == npages) { bidx = i; break; }
-        if (bidx >= 0){
-            LargeBucket* b = &tc->lbuckets[bidx];
-            if (!b->head){
-                while (b->count < b->target){
-                    Span* s = span_alloc(b->pages);
-                    if (!s) break;
-                    s->next_free_addr = (Span*)b->head;
-                    b->head = s;
-                    b->count++;
-                }
-            }
-            if (b->head){
-                sp = (Span*)b->head;
-                b->head = (void*)((Span*)b->head)->next_free_addr;
-                if (b->count) b->count--;
-            }
-        }
-        if (!sp) sp = span_alloc(npages);
-        if (!sp) return NULL;
-        uint8_t* base = (uint8_t*)span_ptr(sp);
+        size_t bytes = npages * ps;
+        void* mem = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mem == MAP_FAILED) return NULL;
+        uint8_t* base = (uint8_t*)mem;
         ObjHdr* h = (ObjHdr*)base;
-        h->owner = (void*)sp;
-        h->size_class = 0xFFFFu;
-        h->flags = 1;
+        h->owner = NULL;
+        h->size_class = (uint16_t)npages;
+        h->flags = 3;
         return (void*)(base + obj_header_size());
     }
     ThreadCache* tc = tc_get();
