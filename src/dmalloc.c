@@ -3,10 +3,22 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <pthread.h>
+#include <stdlib.h>
 
 
 
+typedef struct {
+    void*  head[(MAX_SMALL / D_ALIGN)];
+    size_t count[(MAX_SMALL / D_ALIGN)];
+    size_t limit[(MAX_SMALL / D_ALIGN)];
+} ThreadCache;
+
+/* Center holds per-class central freelists; page-heap operations protected by one big lock */
 static CentralFreeList central[ (MAX_SMALL / D_ALIGN) ];
+static pthread_mutex_t span_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_key_t   tcache_key;
+static pthread_once_t  once_key = PTHREAD_ONCE_INIT;
 
 static inline size_t round_up(size_t x, size_t a){ return (x + a - 1) & ~(a - 1); }
 
@@ -29,9 +41,10 @@ static void central_init_once(void)
                                                memory_order_acq_rel, memory_order_acquire)){
         /* we won the initialization */
         for (size_t i = 0; i < (MAX_SMALL / D_ALIGN); i++){
-            central[i].head = NULL;
+            atomic_store_explicit(&central[i].head, NULL, memory_order_relaxed);
             central[i].obj_size = (i + 1) * D_ALIGN;
         }
+        pthread_key_create(&tcache_key, NULL);
         atomic_store_explicit(&init_state, 2, memory_order_release);
         return;
     }
@@ -39,6 +52,18 @@ static void central_init_once(void)
     while (atomic_load_explicit(&init_state, memory_order_acquire) != 2) {
         /* spin */
     }
+}
+
+static ThreadCache* get_tcache(void)
+{
+    pthread_once(&once_key, (void(*)(void))central_init_once);
+    ThreadCache* tc = (ThreadCache*)pthread_getspecific(tcache_key);
+    if (!tc){
+        tc = (ThreadCache*)calloc(1, sizeof(ThreadCache));
+        for (size_t i = 0; i < (MAX_SMALL / D_ALIGN); i++) tc->limit[i] = 128;
+        pthread_setspecific(tcache_key, tc);
+    }
+    return tc;
 }
 
 static void central_grow(int sc)
@@ -53,7 +78,9 @@ static void central_grow(int sc)
     size_t npages = 1;
     while ((npages * ps) < (span_hdr + slot)) npages++;
 
+    pthread_mutex_lock(&span_mu);
     Span* sp = span_alloc(npages);
+    pthread_mutex_unlock(&span_mu);
     if (!sp) return;
     uint8_t* base = (uint8_t*)span_ptr(sp);
     size_t   bytes = span_page_count(sp) * ps;
@@ -79,9 +106,13 @@ static void central_grow(int sc)
         h->size_class = (uint16_t)sc;
         h->flags = 0;
         void* user = (void*)(p + hdr);
-        /* push into central freelist */
-        *(void**)user = central[sc].head;
-        central[sc].head = user;
+        /* lock-free push into central freelist */
+        void* old_head;
+        do {
+            old_head = atomic_load_explicit(&central[sc].head, memory_order_acquire);
+            *(void**)user = old_head;
+        } while (!atomic_compare_exchange_weak_explicit(&central[sc].head, &old_head, user,
+                                                        memory_order_release, memory_order_acquire));
         ss->total_objs++;
         ss->free_objs++;
     }
@@ -96,7 +127,9 @@ void* dmalloc(size_t size)
         size_t ps = pageheap_page_size();
         size_t need = round_up(size + obj_header_size(), D_ALIGN);
         size_t npages = (need + ps - 1) / ps;
+        pthread_mutex_lock(&span_mu);
         Span* sp = span_alloc(npages);
+        pthread_mutex_unlock(&span_mu);
         if (!sp) return NULL;
         uint8_t* base = (uint8_t*)span_ptr(sp);
         ObjHdr* h = (ObjHdr*)base;
@@ -105,12 +138,42 @@ void* dmalloc(size_t size)
         h->flags = 1; /* large */
         return (void*)(base + obj_header_size());
     }
-    if (!central[sc].head) central_grow(sc);
-    if (!central[sc].head) return NULL;
-    /* pop one */
-    void* user = central[sc].head;
-    central[sc].head = *(void**)user;/*here is tricky, the first few bytes of payload
-                                    is a pointer to the next free object*/
+    ThreadCache* tc = get_tcache();
+    if (!tc->head[sc]){
+        /* refill from center: try pop up to 32 items */
+        for (int i = 0; i < 32; i++){
+            void* old_head = atomic_load_explicit(&central[sc].head, memory_order_acquire);
+            if (!old_head) break;
+            void* next = *(void**)old_head;
+            if (atomic_compare_exchange_weak_explicit(&central[sc].head, &old_head, next,
+                                                      memory_order_release, memory_order_acquire)){
+                *(void**)old_head = tc->head[sc];
+                tc->head[sc] = old_head;
+                tc->count[sc]++;
+            }
+        }
+        /* if still empty, grow central */
+        if (!tc->head[sc]){
+            central_grow(sc);
+            /* retry pop with CAS loop */
+            for (;;) {
+                void* old_head = atomic_load_explicit(&central[sc].head, memory_order_acquire);
+                if (!old_head) break;
+                void* next = *(void**)old_head;
+                if (atomic_compare_exchange_weak_explicit(&central[sc].head, &old_head, next,
+                                                          memory_order_release, memory_order_acquire)){
+                    *(void**)old_head = tc->head[sc];
+                    tc->head[sc] = old_head;
+                    tc->count[sc]++;
+                    break;
+                }
+            }
+        }
+    }
+    if (!tc->head[sc]) return NULL;
+    void* user = tc->head[sc];
+    tc->head[sc] = *(void**)user;
+    tc->count[sc]--;
     ObjHdr* h = (ObjHdr*)((uint8_t*)user - obj_header_size());
     SmallSpan* ss = (SmallSpan*)h->owner;
     if (ss) ss->free_objs--; /* defensive */
@@ -124,42 +187,33 @@ void dfree(void* ptr)
     if (h->flags & 1){
         /* large: free span back to page heap */
         Span* sp = (Span*)h->owner;
+        pthread_mutex_lock(&span_mu);
         span_free(sp);
+        pthread_mutex_unlock(&span_mu);
         return;
     }
-    /* small: push back to central list */
+    /* small: push to thread cache; drain if exceeds limit */
     int sc = (int)h->size_class;
-    *(void**)ptr = central[sc].head;
-    central[sc].head = ptr;
+    ThreadCache* tc = get_tcache();
+    *(void**)ptr = tc->head[sc];
+    tc->head[sc] = ptr;
+    tc->count[sc]++;
     SmallSpan* ss = (SmallSpan*)h->owner;
     if (ss) ss->free_objs++;
-    /* if this SmallSpan is fully free, reclaim the whole span */
-    if (ss && ss->free_objs == ss->total_objs){
-        /* remove all nodes from central list that belong to this SmallSpan */
-        void* cur = central[sc].head;
-        void* prev = NULL;
-        while (cur){
-            ObjHdr* oh = (ObjHdr*)((uint8_t*)cur - obj_header_size());
-            void* next = *(void**)cur;
-            if (oh->owner == (void*)ss){
-                /* unlink cur */
-                if (prev){
-                    *(void**)prev = next;
-                } else {
-                    central[sc].head = next;
-                }
-                cur = next;
-                continue;
-            }
-            prev = cur;
-            cur = next;
+    if (tc->count[sc] > tc->limit[sc]){
+        size_t target = tc->limit[sc] / 2;
+        while (tc->count[sc] > target){
+            void* user = tc->head[sc];
+            tc->head[sc] = *(void**)user;
+            tc->count[sc]--;
+            /* lock-free push into central */
+            void* old_head;
+            do {
+                old_head = atomic_load_explicit(&central[sc].head, memory_order_acquire);
+                *(void**)user = old_head;
+            } while (!atomic_compare_exchange_weak_explicit(&central[sc].head, &old_head, user,
+                                                            memory_order_release, memory_order_acquire));
         }
-        /* find backing Span by address and free it to page heap */
-        Span* backing = pageheap_span_for_addr((void*)ss);
-        if (backing){
-            span_free(backing);
-        }
-        /* Note: ss memory is part of the span and will be invalid after span_free */
     }
 }
 
