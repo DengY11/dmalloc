@@ -182,6 +182,7 @@ void* dmalloc(size_t size)
     central_init_once();
     int sc = size_class_for(size);
     if (sc < 0){
+        if (!pageheap_page_size()) pageheap_init();
         size_t ps = pageheap_page_size();
         size_t need = round_up(size + obj_header_size(), D_ALIGN);
         size_t npages = (need + ps - 1) / ps;
@@ -191,7 +192,7 @@ void* dmalloc(size_t size)
         uint8_t* base = (uint8_t*)mem;
         ObjHdr* h = (ObjHdr*)base;
         h->owner = NULL;
-        h->size_class = (uint16_t)npages;
+        h->size_class = npages;
         h->flags = 3;
         return (void*)(base + obj_header_size());
     }

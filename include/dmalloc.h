@@ -6,9 +6,9 @@
 #define MAX_SMALL   1024
 
 typedef struct _ObjHdr {
-    void* owner;          /* SmallSpan* for small; Span* for large */
-    uint16_t size_class;  /* index for small; 0xFFFF for large */
-    uint16_t flags;       /* bit0: large */
+    void* owner;          /* SmallSpan* for small; Span* for large; NULL for direct */
+    size_t size_class;    /* small: class index; direct: npages; large: sentinel */
+    uint16_t flags;       /* bit0: large; bit1: direct */
 } ObjHdr;
 
 typedef struct _CentralFreeList {
