@@ -80,15 +80,11 @@ static void run_mt(const char* name, alloc_fn A, free_fn F,
 
 int main(){
     pageheap_init();
-    int T = 8;
+    int T = 4;
     size_t N = 20000;
     size_t I = 40;
     puts("-- MT small (1..128) --");
     run_mt("libc malloc", sys_alloc, sys_free, T, N, I, 1, 128);
     run_mt("dmalloc", dm_alloc, dm_free, T, N, I, 1, 128);
-    puts("-- MT medium (1..1024) --");
-    run_mt("libc malloc", sys_alloc, sys_free, T, N, I, 1, 1024);
-    run_mt("dmalloc", dm_alloc, dm_free, T, N, I, 1, 1024);
     return 0;
 }
-

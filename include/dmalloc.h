@@ -13,8 +13,8 @@ typedef struct _ObjHdr {
 } ObjHdr;
 
 typedef struct _CentralFreeList {
-    _Atomic(void*) head;  /* lock-free stack of free objects (payload stores next) */
-    size_t         obj_size;     /* payload size for this class */
+    struct _SmallSpan* span_head;
+    size_t             obj_size;
 } CentralFreeList;
 
 typedef struct _ThreadCache {
@@ -24,9 +24,11 @@ typedef struct _ThreadCache {
 } ThreadCache;
 
 typedef struct _SmallSpan {
-    size_t  size_class;   /* owning size class */
-    size_t  total_objs;   /* number of objects in this span */
-    size_t  free_objs;    /* number of free objects currently */
+    size_t  size_class;
+    size_t  total_objs;
+    size_t  free_objs;
+    void*   free_list;
+    struct _SmallSpan* next;
 } SmallSpan;
 
 /* small object allocator API */

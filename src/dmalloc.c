@@ -8,15 +8,11 @@
 
 
 
-typedef struct {
-    void*  head[(MAX_SMALL / D_ALIGN)];
-    size_t count[(MAX_SMALL / D_ALIGN)];
-    size_t limit[(MAX_SMALL / D_ALIGN)];
-} ThreadCache;
 
 /* Center holds per-class central freelists; page-heap operations protected by one big lock */
 static CentralFreeList central[ (MAX_SMALL / D_ALIGN) ];
 static pthread_mutex_t span_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t center_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_key_t   tcache_key;
 static pthread_once_t  once_key = PTHREAD_ONCE_INIT;
 
@@ -41,7 +37,7 @@ static void central_init_once(void)
                                                memory_order_acq_rel, memory_order_acquire)){
         /* we won the initialization */
         for (size_t i = 0; i < (MAX_SMALL / D_ALIGN); i++){
-            atomic_store_explicit(&central[i].head, NULL, memory_order_relaxed);
+            central[i].span_head = NULL;
             central[i].obj_size = (i + 1) * D_ALIGN;
         }
         pthread_key_create(&tcache_key, NULL);
@@ -85,11 +81,12 @@ static void central_grow(int sc)
     uint8_t* base = (uint8_t*)span_ptr(sp);
     size_t   bytes = span_page_count(sp) * ps;
 
-    /* place SmallSpan header at the beginning of span */
     SmallSpan* ss = (SmallSpan*)base;
     ss->size_class = (size_t)sc;
     ss->total_objs = 0;
     ss->free_objs  = 0;
+    ss->free_list  = NULL;
+    ss->next       = NULL;
 
     size_t offset = span_hdr;
     size_t capacity = (bytes > offset) ? ((bytes - offset) / slot) : 0;
@@ -106,16 +103,15 @@ static void central_grow(int sc)
         h->size_class = (uint16_t)sc;
         h->flags = 0;
         void* user = (void*)(p + hdr);
-        /* lock-free push into central freelist */
-        void* old_head;
-        do {
-            old_head = atomic_load_explicit(&central[sc].head, memory_order_acquire);
-            *(void**)user = old_head;
-        } while (!atomic_compare_exchange_weak_explicit(&central[sc].head, &old_head, user,
-                                                        memory_order_release, memory_order_acquire));
+        *(void**)user = ss->free_list;
+        ss->free_list = user;
         ss->total_objs++;
         ss->free_objs++;
     }
+    pthread_mutex_lock(&center_mu);
+    ss->next = central[sc].span_head;
+    central[sc].span_head = ss;
+    pthread_mutex_unlock(&center_mu);
 }
 
 void* dmalloc(size_t size)
@@ -140,35 +136,31 @@ void* dmalloc(size_t size)
     }
     ThreadCache* tc = get_tcache();
     if (!tc->head[sc]){
-        /* refill from center: try pop up to 32 items */
-        for (int i = 0; i < 32; i++){
-            void* old_head = atomic_load_explicit(&central[sc].head, memory_order_acquire);
-            if (!old_head) break;
-            void* next = *(void**)old_head;
-            if (atomic_compare_exchange_weak_explicit(&central[sc].head, &old_head, next,
-                                                      memory_order_release, memory_order_acquire)){
-                *(void**)old_head = tc->head[sc];
-                tc->head[sc] = old_head;
-                tc->count[sc]++;
-            }
-        }
-        /* if still empty, grow central */
-        if (!tc->head[sc]){
+        pthread_mutex_lock(&center_mu);
+        SmallSpan* prev = NULL;
+        SmallSpan* cur  = central[sc].span_head;
+        while (cur && !cur->free_list){ prev = cur; cur = cur->next; }
+        if (!cur){
+            pthread_mutex_unlock(&center_mu);
             central_grow(sc);
-            /* retry pop with CAS loop */
-            for (;;) {
-                void* old_head = atomic_load_explicit(&central[sc].head, memory_order_acquire);
-                if (!old_head) break;
-                void* next = *(void**)old_head;
-                if (atomic_compare_exchange_weak_explicit(&central[sc].head, &old_head, next,
-                                                          memory_order_release, memory_order_acquire)){
-                    *(void**)old_head = tc->head[sc];
-                    tc->head[sc] = old_head;
-                    tc->count[sc]++;
-                    break;
-                }
-            }
+            pthread_mutex_lock(&center_mu);
+            prev = NULL;
+            cur  = central[sc].span_head;
+            while (cur && !cur->free_list){ prev = cur; cur = cur->next; }
         }
+        int batch = 32;
+        while (cur && cur->free_list && batch--){
+            void* user = cur->free_list;
+            cur->free_list = *(void**)user;
+            *(void**)user = tc->head[sc];
+            tc->head[sc] = user;
+            tc->count[sc]++;
+        }
+        if (cur && !cur->free_list){
+            if (prev) prev->next = cur->next; else central[sc].span_head = cur->next;
+            cur->next = NULL;
+        }
+        pthread_mutex_unlock(&center_mu);
     }
     if (!tc->head[sc]) return NULL;
     void* user = tc->head[sc];
@@ -202,18 +194,24 @@ void dfree(void* ptr)
     if (ss) ss->free_objs++;
     if (tc->count[sc] > tc->limit[sc]){
         size_t target = tc->limit[sc] / 2;
+        pthread_mutex_lock(&center_mu);
         while (tc->count[sc] > target){
             void* user = tc->head[sc];
             tc->head[sc] = *(void**)user;
             tc->count[sc]--;
-            /* lock-free push into central */
-            void* old_head;
-            do {
-                old_head = atomic_load_explicit(&central[sc].head, memory_order_acquire);
-                *(void**)user = old_head;
-            } while (!atomic_compare_exchange_weak_explicit(&central[sc].head, &old_head, user,
-                                                            memory_order_release, memory_order_acquire));
+            ObjHdr* h = (ObjHdr*)((uint8_t*)user - obj_header_size());
+            SmallSpan* ss = (SmallSpan*)h->owner;
+            int need_insert = ss->free_list == NULL;
+            *(void**)user = ss->free_list;
+            ss->free_list = user;
+            if (need_insert){
+                SmallSpan* it = central[sc].span_head;
+                int exists = 0;
+                while (it){ if (it == ss){ exists = 1; break; } it = it->next; }
+                if (!exists){ ss->next = central[sc].span_head; central[sc].span_head = ss; }
+            }
         }
+        pthread_mutex_unlock(&center_mu);
     }
 }
 
