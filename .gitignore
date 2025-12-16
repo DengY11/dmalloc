@@ -1,1 +1,6 @@
 build/
+.trae/
+.cursor/
+.vscode/
+.codex/
+.idea/
