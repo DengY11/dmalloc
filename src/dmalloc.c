@@ -5,21 +5,12 @@
 #include <stdatomic.h>
 #include <pthread.h>
 #include <stdlib.h>
+#include <sys/mman.h>
 
 
 
 static CentralFreeList central[ (MAX_SMALL / D_ALIGN) ];
 static pthread_mutex_t central_lock[ (MAX_SMALL / D_ALIGN) ];
-
-typedef struct {
-    void* head;
-    size_t count;
-} TCacheList;
-
-typedef struct {
-    TCacheList lists[ (MAX_SMALL / D_ALIGN) ];
-} ThreadCache;
-
 static pthread_key_t tc_key;
 static pthread_once_t tc_once = PTHREAD_ONCE_INIT;
 
@@ -174,6 +165,13 @@ static ThreadCache* tc_get(void)
         tc = (ThreadCache*)malloc(sizeof(ThreadCache));
         if (!tc) return NULL;
         memset(tc, 0, sizeof(ThreadCache));
+        size_t pages[LARGE_BUCKET_COUNT] = {4,8,16,32,64,128,256,512};
+        for (int i = 0; i < LARGE_BUCKET_COUNT; i++){
+            tc->lbuckets[i].head = NULL;
+            tc->lbuckets[i].count = 0;
+            tc->lbuckets[i].target = 16;
+            tc->lbuckets[i].pages = pages[i];
+        }
         pthread_setspecific(tc_key, tc);
     }
     return tc;
@@ -184,17 +182,49 @@ void* dmalloc(size_t size)
     central_init_once();
     int sc = size_class_for(size);
     if (sc < 0){
-        /* large object: allocate span of sufficient pages */
         size_t ps = pageheap_page_size();
         size_t need = round_up(size + obj_header_size(), D_ALIGN);
         size_t npages = (need + ps - 1) / ps;
-        Span* sp = span_alloc(npages);
+        if (npages >= 32){
+            size_t bytes = npages * ps;
+            void* mem = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (mem == MAP_FAILED) return NULL;
+            uint8_t* base = (uint8_t*)mem;
+            ObjHdr* h = (ObjHdr*)base;
+            h->owner = NULL;
+            h->size_class = (uint16_t)npages;
+            h->flags = 3;
+            return (void*)(base + obj_header_size());
+        }
+        ThreadCache* tc = tc_get();
+        if (!tc) return NULL;
+        Span* sp = NULL;
+        int bidx = -1;
+        for (int i = 0; i < LARGE_BUCKET_COUNT; i++) if (tc->lbuckets[i].pages == npages) { bidx = i; break; }
+        if (bidx >= 0){
+            LargeBucket* b = &tc->lbuckets[bidx];
+            if (!b->head){
+                while (b->count < b->target){
+                    Span* s = span_alloc(b->pages);
+                    if (!s) break;
+                    s->next_free_addr = (Span*)b->head;
+                    b->head = s;
+                    b->count++;
+                }
+            }
+            if (b->head){
+                sp = (Span*)b->head;
+                b->head = (void*)((Span*)b->head)->next_free_addr;
+                if (b->count) b->count--;
+            }
+        }
+        if (!sp) sp = span_alloc(npages);
         if (!sp) return NULL;
         uint8_t* base = (uint8_t*)span_ptr(sp);
         ObjHdr* h = (ObjHdr*)base;
         h->owner = (void*)sp;
         h->size_class = 0xFFFFu;
-        h->flags = 1; /* large */
+        h->flags = 1;
         return (void*)(base + obj_header_size());
     }
     ThreadCache* tc = tc_get();
@@ -225,10 +255,18 @@ void dfree(void* ptr)
     if (!ptr) return;
     ObjHdr* h = (ObjHdr*)((uint8_t*)ptr - obj_header_size());
     if (h->flags & 1){
-        /* large: free span back to page heap */
-        Span* sp = (Span*)h->owner;
-        span_free(sp);
-        return;
+        if (h->flags & 2){
+            size_t ps = pageheap_page_size();
+            size_t npages = h->size_class;
+            uint8_t* base = (uint8_t*)h;
+            size_t bytes = npages * ps;
+            munmap(base, bytes);
+            return;
+        } else {
+            Span* sp = (Span*)h->owner;
+            span_free(sp);
+            return;
+        }
     }
     int sc = (int)h->size_class;
     ThreadCache* tc = tc_get();
@@ -271,10 +309,15 @@ void* drealloc(void* ptr, size_t size)
     /* copy min(old_size, new_size) */
     size_t old_payload;
     if (h->flags & 1){
-        /* large: compute bytes from span size */
-        Span* sp = (Span*)h->owner;
         size_t ps = pageheap_page_size();
-        size_t total = span_page_count(sp) * ps;
+        size_t total;
+        if (h->flags & 2){
+            size_t npages = h->size_class;
+            total = npages * ps;
+        } else {
+            Span* sp = (Span*)h->owner;
+            total = span_page_count(sp) * ps;
+        }
         old_payload = (total > obj_header_size()) ? (total - obj_header_size()) : 0;
     } else {
         old_payload = central[h->size_class].obj_size;

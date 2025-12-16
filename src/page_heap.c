@@ -249,7 +249,8 @@ Span* span_alloc(size_t page_count)
     pthread_mutex_lock(&page_heap_mutex);
     Span* s = find_suitable(page_count);
     if (!s){
-        size_t grow = page_count < DEFAULT_GROW_PAGES ? DEFAULT_GROW_PAGES : page_count;
+        size_t grow = page_count;
+        if (page_count < DEFAULT_GROW_PAGES && page_count < 32) grow = DEFAULT_GROW_PAGES;
         if (pageheap_grow_nolock(grow) != 0){ pthread_mutex_unlock(&page_heap_mutex); return NULL; }
         s = find_suitable(page_count);
         if (!s){ pthread_mutex_unlock(&page_heap_mutex); return NULL; }

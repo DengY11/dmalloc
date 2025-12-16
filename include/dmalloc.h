@@ -22,6 +22,25 @@ typedef struct _SmallSpan {
     size_t  free_objs;    /* number of free objects currently */
 } SmallSpan;
 
+typedef struct {
+    void* head;
+    size_t count;
+} TCacheList;
+
+typedef struct {
+    void* head;
+    size_t count;
+    size_t target;
+    size_t pages;
+} LargeBucket;
+
+#define LARGE_BUCKET_COUNT 8
+
+typedef struct {
+    TCacheList  lists[ (MAX_SMALL / D_ALIGN) ];
+    LargeBucket lbuckets[LARGE_BUCKET_COUNT];
+} ThreadCache;
+
 void* dmalloc(size_t size);
 void  dfree(void* ptr);
 void* drealloc(void* ptr, size_t size);

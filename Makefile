@@ -8,7 +8,8 @@ BUILD_DIR:= build
 
 SRCS     := $(SRC_DIR)/page_heap.c $(SRC_DIR)/large_bucket.c $(SRC_DIR)/dmalloc.c
 
-TESTS    := $(BUILD_DIR)/test_page_heap $(BUILD_DIR)/test_large_bucket $(BUILD_DIR)/test_dmalloc $(BUILD_DIR)/test_mt
+TESTS    := $(BUILD_DIR)/test_page_heap $(BUILD_DIR)/test_large_bucket $(BUILD_DIR)/test_dmalloc $(BUILD_DIR)/test_mt $(BUILD_DIR)/test_free_release
+BENCH    := $(BUILD_DIR)/bench_alloc
 
 .PHONY: all clean test run-tests
 
@@ -29,11 +30,22 @@ $(BUILD_DIR)/test_dmalloc: $(BUILD_DIR) $(SRCS) $(TEST_DIR)/test_dmalloc.c inclu
 $(BUILD_DIR)/test_mt: $(BUILD_DIR) $(SRCS) $(TEST_DIR)/test_mt.c include/dmalloc.h include/page_heap.h
 	$(CC) $(CFLAGS) $(SRCS) $(TEST_DIR)/test_mt.c -o $@ $(LDFLAGS)
 
+$(BUILD_DIR)/test_free_release: $(BUILD_DIR) $(SRCS) $(TEST_DIR)/test_free_release.c include/dmalloc.h include/page_heap.h
+	$(CC) $(CFLAGS) $(SRCS) $(TEST_DIR)/test_free_release.c -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/bench_alloc: $(BUILD_DIR) $(SRCS) $(TEST_DIR)/bench_alloc.c include/dmalloc.h include/page_heap.h
+	$(CC) $(CFLAGS) $(SRCS) $(TEST_DIR)/bench_alloc.c -o $@ $(LDFLAGS)
+
 test: $(TESTS)
 	$(BUILD_DIR)/test_page_heap
 	$(BUILD_DIR)/test_large_bucket
 	$(BUILD_DIR)/test_dmalloc
 	$(BUILD_DIR)/test_mt
+	$(BUILD_DIR)/test_free_release
+
+.PHONY: bench
+bench: $(BENCH)
+	$(BUILD_DIR)/bench_alloc
 
 run-tests: test
 
