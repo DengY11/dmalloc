@@ -21,7 +21,10 @@ static __thread ThreadCache* tls_tc;
 static atomic_ulong dfree_counter = ATOMIC_VAR_INIT(0);
 
 static inline size_t tcache_max(void){ return 64; }
-static inline size_t tcache_refill_batch(void){ return 256; }
+static inline size_t tcache_refill_batch_for_sc(int sc){
+    size_t obj = central[0][sc].obj_size;
+    return (obj <= 64) ? 512 : 256;
+}
 static inline size_t tcache_release_batch(void){ return 256; }
 
 static inline size_t round_up(size_t x, size_t a){ return (x + a - 1) & ~(a - 1); }
@@ -141,10 +144,11 @@ static size_t central_fetch_batch(int sc, void** out, size_t n)
     }
     while (central[shard][sc].head && got < n){
         void* user = central[shard][sc].head;
+        __builtin_prefetch(*(void**)user, 0, 1);
         central[shard][sc].head = *(void**)user;
         ObjHdr* h = (ObjHdr*)((uint8_t*)user - obj_header_size());
         SmallSpan* ss = (SmallSpan*)h->owner;
-        if (ss) ss->free_objs--;
+        if (__builtin_expect(!!ss, 1)) ss->free_objs--;
         out[got++] = user;
     }
     #ifdef DMALLOC_STATS
@@ -228,7 +232,7 @@ void* dmalloc(size_t size)
     if (!tc) return NULL;
     TCacheList* list = &tc->lists[sc];
     if (!list->head){
-        size_t batch = tcache_refill_batch();
+        size_t batch = tcache_refill_batch_for_sc(sc);
         void* tmp[ batch ];
         size_t got = central_fetch_batch(sc, (void**)tmp, batch);
         for (size_t i = 0; i < got; i++){
