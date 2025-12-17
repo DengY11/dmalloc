@@ -9,7 +9,7 @@
 
 
 
-#define CENTRAL_SHARDS 16
+#define CENTRAL_SHARDS 64
 static CentralFreeList central[ CENTRAL_SHARDS ][ (MAX_SMALL / D_ALIGN) ];
 static pthread_mutex_t central_lock[ CENTRAL_SHARDS ][ (MAX_SMALL / D_ALIGN) ];
 /* optional stats */
@@ -20,12 +20,14 @@ static atomic_ulong stat_fetch_batches[ CENTRAL_SHARDS ][ (MAX_SMALL / D_ALIGN) 
 static __thread ThreadCache* tls_tc;
 static atomic_ulong dfree_counter = ATOMIC_VAR_INIT(0);
 
-static inline size_t tcache_max(void){ return 128; }
+static inline size_t tcache_max(void){ return 512; }
 static inline size_t tcache_refill_batch_for_sc(int sc){
     size_t obj = central[0][sc].obj_size;
-    return (obj <= 64) ? 512 : 256;
+    if (obj <= 64) return 1024;
+    if (obj <= 256) return 512;
+    return 256;
 }
-static inline size_t tcache_release_batch(void){ return 256; }
+static inline size_t tcache_release_batch(void){ return 512; }
 
 static inline size_t round_up(size_t x, size_t a){ return (x + a - 1) & ~(a - 1); }
 
@@ -39,10 +41,20 @@ static inline int size_class_for(size_t size){
 static inline size_t obj_header_size(void){ return round_up(sizeof(ObjHdr), D_ALIGN); }
 static inline size_t small_span_header_size(void){ return round_up(sizeof(SmallSpan), D_ALIGN); }
 
+static inline uint32_t hash32(uintptr_t x){
+    x ^= x >> 16;
+    x *= 0x85ebca6bul;
+    x ^= x >> 13;
+    x *= 0xc2b2ae35ul;
+    x ^= x >> 16;
+    return (uint32_t)x;
+}
 static inline int shard_index(void){
+    if (tls_tc && tls_tc->shard_id >= 0) return tls_tc->shard_id;
     uintptr_t h = (uintptr_t)tls_tc;
     if (!h) h = (uintptr_t)pthread_self();
-    return (int)(((h >> 12) & (CENTRAL_SHARDS - 1)));
+    uint32_t v = hash32(h);
+    return (int)(v & (CENTRAL_SHARDS - 1));
 }
 
 static void central_init_once(void)
@@ -189,6 +201,10 @@ static ThreadCache* tc_get(void)
             tc->lbuckets[i].target = 16;
             tc->lbuckets[i].pages = pages[i];
         }
+        /* precompute shard id */
+        uintptr_t h = (uintptr_t)tc;
+        if (!h) h = (uintptr_t)pthread_self();
+        tc->shard_id = (int)(hash32(h) & (CENTRAL_SHARDS - 1));
         tls_tc = tc;
     }
     return tc;
@@ -213,7 +229,7 @@ void* dmalloc(size_t size)
                     if (lb->count) lb->count--;
                     h->owner = NULL;
                     h->size_class = npages;
-                    h->flags = 3;
+                    h->flags = (OBJ_FLAG_LARGE | OBJ_FLAG_DIRECT);
                     return (void*)((uint8_t*)h + obj_header_size());
                 }
             }
@@ -225,7 +241,7 @@ void* dmalloc(size_t size)
         ObjHdr* h = (ObjHdr*)base;
         h->owner = NULL;
         h->size_class = npages;
-        h->flags = 3;
+        h->flags = (OBJ_FLAG_LARGE | OBJ_FLAG_DIRECT);
         return (void*)(base + obj_header_size());
     }
     ThreadCache* tc = tc_get();
@@ -253,8 +269,8 @@ void dfree(void* ptr)
 {
     if (!ptr) return;
     ObjHdr* h = (ObjHdr*)((uint8_t*)ptr - obj_header_size());
-    if (h->flags & 1){
-        if (h->flags & 2){
+    if (h->flags & OBJ_FLAG_LARGE){
+        if (h->flags & OBJ_FLAG_DIRECT){
             size_t ps = pageheap_page_size();
             size_t npages = h->size_class;
             ThreadCache* tc = tc_get();
@@ -316,7 +332,7 @@ void* drealloc(void* ptr, size_t size)
     ObjHdr* h = (ObjHdr*)((uint8_t*)ptr - obj_header_size());
     /* if small and same class, return as is */
     int new_sc = size_class_for(size);
-    if (!(h->flags & 1)){
+    if (!(h->flags & OBJ_FLAG_LARGE)){
         int old_sc = (int)h->size_class;
         if (old_sc == new_sc && old_sc >= 0) return ptr;
     }
@@ -324,10 +340,10 @@ void* drealloc(void* ptr, size_t size)
     if (!n) return NULL;
     /* copy min(old_size, new_size) */
     size_t old_payload;
-    if (h->flags & 1){
+    if (h->flags & OBJ_FLAG_LARGE){
         size_t ps = pageheap_page_size();
         size_t total;
-        if (h->flags & 2){
+        if (h->flags & OBJ_FLAG_DIRECT){
             size_t npages = h->size_class;
             total = npages * ps;
         } else {

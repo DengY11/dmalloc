@@ -328,30 +328,42 @@ size_t pageheap_release_empty_spans(size_t min_pages)
     if (!page_heap.page_size) pageheap_init();
     if (min_pages == 0) min_pages = 1;
     size_t released_pages = 0;
+    typedef struct { void* addr; size_t bytes; } Rel;
+    Rel* rels = NULL; size_t cap = 0, n = 0;
     pthread_mutex_lock(&page_heap_mutex);
     Span* cur = page_heap.addr_head;
     while (cur){
         Span* next = cur->next_addr; /* save next since cur may be removed */
         if (!cur->in_use && cur->page_count >= min_pages){
             size_t bytes = cur->page_count * psize();
-            if (munmap(cur->start, bytes) == 0){
-                /* unlink from bucket and addr list */
-                bucket_remove(cur);
-                addr_remove(cur);
-                /* update stats */
-                page_heap.mapped_pages -= cur->page_count;
-                page_heap.free_pages   -= cur->page_count;
-                page_heap.spans_free   -= 1;
-                released_pages         += cur->page_count;
-                /* recycle metadata */
-                meta_release(cur);
-            } else {
-                /* munmap failed; keep span intact. Optionally fall back to madvise here. */
+            /* unlink from bucket and addr list */
+            bucket_remove(cur);
+            addr_remove(cur);
+            /* update stats */
+            page_heap.mapped_pages -= cur->page_count;
+            page_heap.free_pages   -= cur->page_count;
+            page_heap.spans_free   -= 1;
+            released_pages         += cur->page_count;
+            /* record for system call outside lock */
+            if (n == cap){
+                size_t newcap = cap ? cap * 2 : 16;
+                Rel* tmp = (Rel*)realloc(rels, newcap * sizeof(Rel));
+                if (tmp){ rels = tmp; cap = newcap; }
             }
+            if (n < cap){ rels[n].addr = cur->start; rels[n].bytes = bytes; n++; }
+            else {
+                /* fallback: perform munmap while holding lock if allocation failed */
+                (void)munmap(cur->start, bytes);
+            }
+            /* recycle metadata */
+            meta_release(cur);
         }
         cur = next;
     }
     pthread_mutex_unlock(&page_heap_mutex);
+    /* perform system calls outside lock */
+    for (size_t i = 0; i < n; i++) (void)munmap(rels[i].addr, rels[i].bytes);
+    free(rels);
     return released_pages;
 }
 
@@ -361,18 +373,30 @@ size_t pageheap_madvise_idle_spans(size_t min_pages)
     if (!page_heap.page_size) pageheap_init();
     if (min_pages == 0) min_pages = 1;
     size_t advised_pages = 0;
+    typedef struct { void* addr; size_t bytes; } Adv;
+    Adv* advs = NULL; size_t cap = 0, n = 0;
     pthread_mutex_lock(&page_heap_mutex);
     Span* cur = page_heap.addr_head;
     while (cur){
         Span* next = cur->next_addr;
         if (!cur->in_use && cur->page_count >= min_pages){
             size_t bytes = cur->page_count * psize();
-            /* ignore errors; madvise may fail on some OS */
-            (void)madvise(cur->start, bytes, MADV_DONTNEED);
             advised_pages += cur->page_count;
+            if (n == cap){
+                size_t newcap = cap ? cap * 2 : 16;
+                Adv* tmp = (Adv*)realloc(advs, newcap * sizeof(Adv));
+                if (tmp){ advs = tmp; cap = newcap; }
+            }
+            if (n < cap){ advs[n].addr = cur->start; advs[n].bytes = bytes; n++; }
+            else {
+                /* fallback: perform madvise while holding lock */
+                (void)madvise(cur->start, bytes, MADV_DONTNEED);
+            }
         }
         cur = next;
     }
     pthread_mutex_unlock(&page_heap_mutex);
+    for (size_t i = 0; i < n; i++) (void)madvise(advs[i].addr, advs[i].bytes, MADV_DONTNEED);
+    free(advs);
     return advised_pages;
 }

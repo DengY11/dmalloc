@@ -5,6 +5,10 @@
 #define D_ALIGN     16
 #define MAX_SMALL   1024
 
+/* ObjHdr flags */
+#define OBJ_FLAG_LARGE   0x1  /* object spans pages (large path) */
+#define OBJ_FLAG_DIRECT  0x2  /* directly mmapped (not via Span metadata) */
+
 typedef struct _ObjHdr {
     void* owner;          /* SmallSpan* for small; Span* for large; NULL for direct */
     size_t size_class;    /* small: class index; direct: npages; large: sentinel */
@@ -39,6 +43,7 @@ typedef struct {
 typedef struct {
     TCacheList  lists[ (MAX_SMALL / D_ALIGN) ];
     LargeBucket lbuckets[LARGE_BUCKET_COUNT];
+    int shard_id; /* computed shard index for central freelists */
 } ThreadCache;
 
 void* dmalloc(size_t size);

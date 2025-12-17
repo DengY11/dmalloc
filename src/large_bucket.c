@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <time.h>
+#include <pthread.h>
 #include <sys/mman.h>
 
 static inline int skip_less(const Span* a, const Span* b){
@@ -11,9 +12,29 @@ static inline int skip_less(const Span* a, const Span* b){
     return (uintptr_t)a->start < (uintptr_t)b->start;
 }
 
+static __thread uint64_t rng_state;
+static inline uint64_t mix64(uint64_t x){
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return x;
+}
+static inline uint32_t tls_rand(void){
+    if (rng_state == 0){
+        uintptr_t t = (uintptr_t)pthread_self();
+        rng_state = mix64(t ^ (uintptr_t)&rng_state);
+        if (rng_state == 0) rng_state = 0x9e3779b97f4a7c15ULL;
+    }
+    rng_state ^= rng_state << 13;
+    rng_state ^= rng_state >> 7;
+    rng_state ^= rng_state << 17;
+    return (uint32_t)rng_state;
+}
 static int random_level(void){
     int lvl = 1;
-    while ((rand() & 1) && lvl < MAX_SKIP_LEVELS) lvl++;
+    while ((tls_rand() & 1u) && lvl < MAX_SKIP_LEVELS) lvl++;
     return lvl;
 }
 
@@ -35,8 +56,6 @@ static void ensure_head(PageHeap* heap)
 
 void large_bucket_init(PageHeap* heap)
 {
-    /* seed RNG for random level */
-    srand((unsigned)time(NULL));
     heap->large_skip_head = NULL;
     ensure_head(heap);
 }
