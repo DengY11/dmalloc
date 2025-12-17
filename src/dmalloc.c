@@ -9,7 +9,7 @@
 
 
 
-#define CENTRAL_SHARDS 8
+#define CENTRAL_SHARDS 16
 static CentralFreeList central[ CENTRAL_SHARDS ][ (MAX_SMALL / D_ALIGN) ];
 static pthread_mutex_t central_lock[ CENTRAL_SHARDS ][ (MAX_SMALL / D_ALIGN) ];
 /* optional stats */
@@ -20,7 +20,7 @@ static atomic_ulong stat_fetch_batches[ CENTRAL_SHARDS ][ (MAX_SMALL / D_ALIGN) 
 static __thread ThreadCache* tls_tc;
 static atomic_ulong dfree_counter = ATOMIC_VAR_INIT(0);
 
-static inline size_t tcache_max(void){ return 64; }
+static inline size_t tcache_max(void){ return 128; }
 static inline size_t tcache_refill_batch_for_sc(int sc){
     size_t obj = central[0][sc].obj_size;
     return (obj <= 64) ? 512 : 256;
@@ -182,7 +182,7 @@ static ThreadCache* tc_get(void)
         if (mem == MAP_FAILED) return NULL;
         tc = (ThreadCache*)mem;
         memset(tc, 0, sizeof(ThreadCache));
-        size_t pages[LARGE_BUCKET_COUNT] = {4,8,16,32,64,128,256,512};
+        size_t pages[LARGE_BUCKET_COUNT] = {4,6,8,9,10,12,16,20,24,32,48,64,96,128,192,256};
         for (int i = 0; i < LARGE_BUCKET_COUNT; i++){
             tc->lbuckets[i].head = NULL;
             tc->lbuckets[i].count = 0;

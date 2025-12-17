@@ -34,7 +34,7 @@ typedef struct {
     size_t pages;
 } LargeBucket;
 
-#define LARGE_BUCKET_COUNT 8
+#define LARGE_BUCKET_COUNT 16
 
 typedef struct {
     TCacheList  lists[ (MAX_SMALL / D_ALIGN) ];
