@@ -9,14 +9,20 @@
 
 
 
-static CentralFreeList central[ (MAX_SMALL / D_ALIGN) ];
-static pthread_mutex_t central_lock[ (MAX_SMALL / D_ALIGN) ];
-static pthread_key_t tc_key;
-static pthread_once_t tc_once = PTHREAD_ONCE_INIT;
+#define CENTRAL_SHARDS 4
+static CentralFreeList central[ CENTRAL_SHARDS ][ (MAX_SMALL / D_ALIGN) ];
+static pthread_mutex_t central_lock[ CENTRAL_SHARDS ][ (MAX_SMALL / D_ALIGN) ];
+/* optional stats */
+#ifdef DMALLOC_STATS
+static atomic_ulong stat_fetch_tries[ CENTRAL_SHARDS ][ (MAX_SMALL / D_ALIGN) ];
+static atomic_ulong stat_fetch_batches[ CENTRAL_SHARDS ][ (MAX_SMALL / D_ALIGN) ];
+#endif
+static __thread ThreadCache* tls_tc;
+static atomic_ulong dfree_counter = ATOMIC_VAR_INIT(0);
 
 static inline size_t tcache_max(void){ return 64; }
-static inline size_t tcache_refill_batch(void){ return 32; }
-static inline size_t tcache_release_batch(void){ return 64; }
+static inline size_t tcache_refill_batch(void){ return 256; }
+static inline size_t tcache_release_batch(void){ return 256; }
 
 static inline size_t round_up(size_t x, size_t a){ return (x + a - 1) & ~(a - 1); }
 
@@ -30,6 +36,12 @@ static inline int size_class_for(size_t size){
 static inline size_t obj_header_size(void){ return round_up(sizeof(ObjHdr), D_ALIGN); }
 static inline size_t small_span_header_size(void){ return round_up(sizeof(SmallSpan), D_ALIGN); }
 
+static inline int shard_index(void){
+    uintptr_t h = (uintptr_t)tls_tc;
+    if (!h) h = (uintptr_t)pthread_self();
+    return (int)(((h >> 12) & (CENTRAL_SHARDS - 1)));
+}
+
 static void central_init_once(void)
 {
     /* init_state: 0=uninitialized, 1=initializing, 2=initialized */
@@ -38,10 +50,12 @@ static void central_init_once(void)
     if (atomic_compare_exchange_strong_explicit(&init_state, &expected, 1,
                                                memory_order_acq_rel, memory_order_acquire)){
         /* we won the initialization */
-        for (size_t i = 0; i < (MAX_SMALL / D_ALIGN); i++){
-            central[i].head = NULL;
-            central[i].obj_size = (i + 1) * D_ALIGN;
-            pthread_mutex_init(&central_lock[i], NULL);
+        for (size_t s = 0; s < CENTRAL_SHARDS; s++){
+            for (size_t i = 0; i < (MAX_SMALL / D_ALIGN); i++){
+                central[s][i].head = NULL;
+                central[s][i].obj_size = (i + 1) * D_ALIGN;
+                pthread_mutex_init(&central_lock[s][i], NULL);
+            }
         }
         atomic_store_explicit(&init_state, 2, memory_order_release);
         return;
@@ -52,17 +66,19 @@ static void central_init_once(void)
     }
 }
 
-static void central_grow(int sc)
+static void central_grow(int sc, int shard)
 {
     size_t ps = pageheap_page_size();
-    size_t payload = central[sc].obj_size;
+    size_t payload = central[0][sc].obj_size;
     size_t hdr = obj_header_size();
     size_t slot = hdr + payload;
     size_t span_hdr = small_span_header_size();
 
-    /* choose pages so that we have at least one object */
+    /* choose pages so that we have at least TARGET objects */
     size_t npages = 1;
+    const size_t TARGET = 512;
     while ((npages * ps) < (span_hdr + slot)) npages++;
+    while (((npages * ps) - span_hdr) / slot < TARGET) npages++;
 
     Span* sp = span_alloc(npages);
     if (!sp) return;
@@ -83,6 +99,7 @@ static void central_grow(int sc)
         return;
     }
 
+    void* chain = NULL;
     for (size_t i = 0; i < capacity; i++){
         uint8_t* p = base + offset + i * slot;
         ObjHdr* h = (ObjHdr*)p;
@@ -90,77 +107,72 @@ static void central_grow(int sc)
         h->size_class = (uint16_t)sc;
         h->flags = 0;
         void* user = (void*)(p + hdr);
-        *(void**)user = central[sc].head;
-        central[sc].head = user;
+        *(void**)user = chain;
+        chain = user;
         ss->total_objs++;
         ss->free_objs++;
     }
+    pthread_mutex_lock(&central_lock[shard][sc]);
+    while (chain){
+        void* u = chain;
+        chain = *(void**)u;
+        *(void**)u = central[shard][sc].head;
+        central[shard][sc].head = u;
+    }
+    pthread_mutex_unlock(&central_lock[shard][sc]);
 }
 
 static size_t central_fetch_batch(int sc, void** out, size_t n)
 {
     size_t got = 0;
-    pthread_mutex_lock(&central_lock[sc]);
-    if (!central[sc].head) central_grow(sc);
-    while (central[sc].head && got < n){
-        void* user = central[sc].head;
-        central[sc].head = *(void**)user;
+    int shard = shard_index();
+    pthread_mutex_lock(&central_lock[shard][sc]);
+    if (!central[shard][sc].head){
+        int tries = 0;
+        while (!central[shard][sc].head && tries < 3){
+            pthread_mutex_unlock(&central_lock[shard][sc]);
+            central_grow(sc, shard);
+            pthread_mutex_lock(&central_lock[shard][sc]);
+            tries++;
+        }
+        #ifdef DMALLOC_STATS
+        atomic_fetch_add_explicit(&stat_fetch_tries[shard][sc], tries, memory_order_relaxed);
+        #endif
+    }
+    while (central[shard][sc].head && got < n){
+        void* user = central[shard][sc].head;
+        central[shard][sc].head = *(void**)user;
         ObjHdr* h = (ObjHdr*)((uint8_t*)user - obj_header_size());
         SmallSpan* ss = (SmallSpan*)h->owner;
         if (ss) ss->free_objs--;
         out[got++] = user;
     }
-    pthread_mutex_unlock(&central_lock[sc]);
+    #ifdef DMALLOC_STATS
+    if (got) atomic_fetch_add_explicit(&stat_fetch_batches[shard][sc], 1, memory_order_relaxed);
+    #endif
+    pthread_mutex_unlock(&central_lock[shard][sc]);
     return got;
 }
 
 static void central_release_batch(int sc, void** list, size_t n)
 {
-    pthread_mutex_lock(&central_lock[sc]);
+    int shard = shard_index();
+    pthread_mutex_lock(&central_lock[shard][sc]);
     for (size_t i = 0; i < n; i++){
         void* ptr = list[i];
-        *(void**)ptr = central[sc].head;
-        central[sc].head = ptr;
+        *(void**)ptr = central[shard][sc].head;
+        central[shard][sc].head = ptr;
         ObjHdr* h = (ObjHdr*)((uint8_t*)ptr - obj_header_size());
         SmallSpan* ss = (SmallSpan*)h->owner;
         if (ss) ss->free_objs++;
     }
-    pthread_mutex_unlock(&central_lock[sc]);
+    pthread_mutex_unlock(&central_lock[shard][sc]);
 }
 
-static void tc_destroy(void* p)
-{
-    ThreadCache* tc = (ThreadCache*)p;
-    if (!tc) return;
-    for (size_t i = 0; i < (MAX_SMALL / D_ALIGN); i++){
-        size_t sc = i;
-        size_t batch = tcache_release_batch();
-        void** tmp = (void**)malloc(sizeof(void*) * batch);
-        while (tc->lists[i].head){
-            size_t n = 0;
-            while (tc->lists[i].head && n < batch){
-                void* user = tc->lists[i].head;
-                tc->lists[i].head = *(void**)user;
-                n++;
-                tmp[n-1] = user;
-            }
-            if (n) central_release_batch((int)sc, tmp, n);
-        }
-        free(tmp);
-        tc->lists[i].count = 0;
-    }
-    free(tc);
-}
-
-static void tc_init_key(void)
-{
-    pthread_key_create(&tc_key, tc_destroy);
-}
 
 static ThreadCache* tc_get(void)
 {
-    pthread_once(&tc_once, tc_init_key);
-    ThreadCache* tc = (ThreadCache*)pthread_getspecific(tc_key);
+    ThreadCache* tc = tls_tc;
     if (!tc){
         tc = (ThreadCache*)malloc(sizeof(ThreadCache));
         if (!tc) return NULL;
@@ -172,7 +184,7 @@ static ThreadCache* tc_get(void)
             tc->lbuckets[i].target = 16;
             tc->lbuckets[i].pages = pages[i];
         }
-        pthread_setspecific(tc_key, tc);
+        tls_tc = tc;
     }
     return tc;
 }
@@ -201,16 +213,14 @@ void* dmalloc(size_t size)
     TCacheList* list = &tc->lists[sc];
     if (!list->head){
         size_t batch = tcache_refill_batch();
-        void** tmp = (void**)malloc(sizeof(void*) * batch);
-        if (!tmp) return NULL;
-        size_t got = central_fetch_batch(sc, tmp, batch);
+        void* tmp[ batch ];
+        size_t got = central_fetch_batch(sc, (void**)tmp, batch);
         for (size_t i = 0; i < got; i++){
-            void* p = tmp[i];
+            void* p = ((void**)tmp)[i];
             *(void**)p = list->head;
             list->head = p;
             list->count++;
         }
-        free(tmp);
         if (!list->head) return NULL;
     }
     void* user = list->head;
@@ -250,16 +260,21 @@ void dfree(void* ptr)
     list->count++;
     if (list->count > tcache_max()){
         size_t batch = tcache_release_batch();
-        void** tmp = (void**)malloc(sizeof(void*) * batch);
+        void* tmp[ batch ];
         size_t n = 0;
         while (list->head && n < batch){
             void* p = list->head;
             list->head = *(void**)p;
             tmp[n++] = p;
         }
-        central_release_batch(sc, tmp, n);
-        free(tmp);
-        if (list->count >= n) list->count -= n; else list->count = 0;
+        if (n){
+            central_release_batch(sc, (void**)tmp, n);
+            if (list->count >= n) list->count -= n; else list->count = 0;
+        }
+    }
+    unsigned long c = atomic_fetch_add_explicit(&dfree_counter, 1, memory_order_relaxed) + 1;
+    if ((c & 0x7FFFFFFUL) == 0){
+        pageheap_madvise_idle_spans(32);
     }
 }
 
@@ -289,7 +304,7 @@ void* drealloc(void* ptr, size_t size)
         }
         old_payload = (total > obj_header_size()) ? (total - obj_header_size()) : 0;
     } else {
-        old_payload = central[h->size_class].obj_size;
+        old_payload = central[0][h->size_class].obj_size;
     }
     size_t copy = old_payload < size ? old_payload : size;
     memcpy(n, ptr, copy);
