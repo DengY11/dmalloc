@@ -44,5 +44,6 @@ typedef struct {
 void* dmalloc(size_t size);
 void  dfree(void* ptr);
 void* drealloc(void* ptr, size_t size);
+void  dmalloc_init(void);
 
 #endif /* DMALLOC_H */

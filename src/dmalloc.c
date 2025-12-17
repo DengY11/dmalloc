@@ -9,7 +9,7 @@
 
 
 
-#define CENTRAL_SHARDS 4
+#define CENTRAL_SHARDS 8
 static CentralFreeList central[ CENTRAL_SHARDS ][ (MAX_SMALL / D_ALIGN) ];
 static pthread_mutex_t central_lock[ CENTRAL_SHARDS ][ (MAX_SMALL / D_ALIGN) ];
 /* optional stats */
@@ -174,8 +174,9 @@ static ThreadCache* tc_get(void)
 {
     ThreadCache* tc = tls_tc;
     if (!tc){
-        tc = (ThreadCache*)malloc(sizeof(ThreadCache));
-        if (!tc) return NULL;
+        void* mem = mmap(NULL, sizeof(ThreadCache), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mem == MAP_FAILED) return NULL;
+        tc = (ThreadCache*)mem;
         memset(tc, 0, sizeof(ThreadCache));
         size_t pages[LARGE_BUCKET_COUNT] = {4,8,16,32,64,128,256,512};
         for (int i = 0; i < LARGE_BUCKET_COUNT; i++){
@@ -198,6 +199,21 @@ void* dmalloc(size_t size)
         size_t ps = pageheap_page_size();
         size_t need = round_up(size + obj_header_size(), D_ALIGN);
         size_t npages = (need + ps - 1) / ps;
+        ThreadCache* tc = tc_get();
+        if (tc){
+            for (int i = 0; i < LARGE_BUCKET_COUNT; i++){
+                LargeBucket* lb = &tc->lbuckets[i];
+                if (lb->pages == npages && lb->head){
+                    ObjHdr* h = (ObjHdr*)lb->head;
+                    lb->head = ((ObjHdr*)lb->head)->owner;
+                    if (lb->count) lb->count--;
+                    h->owner = NULL;
+                    h->size_class = npages;
+                    h->flags = 3;
+                    return (void*)((uint8_t*)h + obj_header_size());
+                }
+            }
+        }
         size_t bytes = npages * ps;
         void* mem = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (mem == MAP_FAILED) return NULL;
@@ -237,6 +253,18 @@ void dfree(void* ptr)
         if (h->flags & 2){
             size_t ps = pageheap_page_size();
             size_t npages = h->size_class;
+            ThreadCache* tc = tc_get();
+            if (tc){
+                for (int i = 0; i < LARGE_BUCKET_COUNT; i++){
+                    LargeBucket* lb = &tc->lbuckets[i];
+                    if (lb->pages == npages && lb->count < lb->target){
+                        h->owner = lb->head;
+                        lb->head = h;
+                        lb->count++;
+                        return;
+                    }
+                }
+            }
             uint8_t* base = (uint8_t*)h;
             size_t bytes = npages * ps;
             munmap(base, bytes);
@@ -310,4 +338,15 @@ void* drealloc(void* ptr, size_t size)
     memcpy(n, ptr, copy);
     dfree(ptr);
     return n;
+}
+
+void dmalloc_init(void)
+{
+    central_init_once();
+    if (!pageheap_page_size()) pageheap_init();
+}
+
+__attribute__((constructor)) static void dmalloc_constructor(void)
+{
+    dmalloc_init();
 }
